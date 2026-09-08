@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { getNarratorVisual, normalizeNarratorStyle } from '../src/narrator-style.js';
+import { getNarratorVisual, getTransientNarratorCount, normalizeNarratorStyle, setTransientNarratorCount } from '../src/narrator-style.js';
 
 test('narrator normalization and visual derivation preserve supported typography', () => {
     const style = normalizeNarratorStyle({
@@ -29,4 +29,14 @@ test('unsupported narrator typography is rejected without discarding valid field
     assert.equal(style.font, 'scriptMonoscript');
     assert.equal(style.style, '');
     assert.equal(style.baseColor, '#abcdef');
+});
+
+test('an unknown narration count stays unknown instead of becoming zero', () => {
+    setTransientNarratorCount(12, 'source-a');
+    assert.equal(getTransientNarratorCount('source-a'), 12);
+    setTransientNarratorCount(null, 'source-a');
+    assert.equal(getTransientNarratorCount('source-a'), null, 'unknown must not read as zero');
+    setTransientNarratorCount(0, 'source-a');
+    assert.equal(getTransientNarratorCount('source-a'), 0, 'a genuine zero stays zero');
+    assert.equal(getTransientNarratorCount('source-b'), null, 'counts stay isolated per source');
 });

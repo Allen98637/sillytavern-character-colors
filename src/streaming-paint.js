@@ -18,13 +18,12 @@ import { applySegmentDecoration, clearSegmentDecoration, decorateNarratorTextNod
 import { getNarratorVisual } from './narrator-style.js';
 import { applyThemeReadabilityAndBrightness } from './palettes.js';
 import { getContext } from './st-api.js';
-import { isDomEngine, resetStreamingSession, settings, streamingSession } from './state.js';
+import { isDomEngine, resetStreamingSession, settings, stableSegmentAssignments, streamingSession } from './state.js';
 import { normalizeSegmentText } from './utils.js';
 import { queueColorStateSave } from './live-colors.js';
 
 const MAX_STREAMING_SEGMENT_ASSIGNMENTS = 512;
 let streamingIdentity = null;
-const stableSegmentAssignments = new Map();
 
 function getStreamingChatIdentity(context) {
     return [
@@ -69,6 +68,7 @@ function captureStreamingIdentity() {
         message,
         messageId: getStreamingMessageId(message),
         swipeId: getStreamingSwipeId(message),
+        thoughtSymbols: settings.thoughtSymbols,
         mesIndex: index,
         mesid: streamingSession.mesElement.getAttribute?.('mesid') ?? String(index),
         lastText: String(message.mes ?? ''),
@@ -88,7 +88,8 @@ function isStreamingIdentityCurrent() {
         || getStreamingMessageId(message) !== streamingIdentity.messageId
         || getStreamingSwipeId(message) !== streamingIdentity.swipeId) return false;
     const text = String(message?.mes ?? '');
-    if (!text.startsWith(streamingIdentity.lastText)) stableSegmentAssignments.clear();
+    if (!text.startsWith(streamingIdentity.lastText)
+        || settings.thoughtSymbols !== streamingIdentity.thoughtSymbols) stableSegmentAssignments.clear();
     if (streamingIdentity.chatRoot
         && document.getElementById?.('chat') !== streamingIdentity.chatRoot) return false;
     return true;
@@ -123,16 +124,26 @@ function stabilizeStreamingAssignments(attribution, overrideOptions) {
         const key = `${segment.delimiter}:${segment.index}`;
         const overridden = overrides && Object.prototype.hasOwnProperty.call(overrides, String(segment.index));
         if (!overridden && stableSegmentAssignments.has(key)) {
-            segment.assignment = { ...stableSegmentAssignments.get(key) };
+            const cached = stableSegmentAssignments.get(key);
+            segment.assignment = cached.assignment ? { ...cached.assignment } : null;
             segment.provenance = { source: 'streaming-cache', method: 'stable-segment-index' };
-            segment.confidence = Math.max(0.8, Number(segment.confidence) || 0);
-        } else if (segment.assignment) {
-            stableSegmentAssignments.set(key, { ...segment.assignment });
+            // A reused guess keeps the confidence it earned; repainting must not
+            // manufacture high confidence for a weak attribution.
+            segment.confidence = cached.confidence ?? (Number(segment.confidence) || 0);
+        } else {
+            stableSegmentAssignments.set(key, { start: segment.start, assignment: segment.assignment ? { ...segment.assignment } : null, confidence: Number(segment.confidence) || 0 });
         }
     }
     while (stableSegmentAssignments.size > MAX_STREAMING_SEGMENT_ASSIGNMENTS) {
         stableSegmentAssignments.delete(stableSegmentAssignments.keys().next().value);
     }
+}
+
+export function getPaintedStreamingAssignment(mesIndex, message, segment) {
+    if (streamingIdentity?.mesIndex !== mesIndex || streamingIdentity.message !== message
+        || !isStreamingIdentityCurrent()) return undefined;
+    const cached = stableSegmentAssignments.get(`${segment.delimiter}:${segment.index}`);
+    return cached?.start === segment.start ? cached.assignment : undefined;
 }
 
 export function paintStreamingMessage() {
@@ -195,7 +206,10 @@ export function paintStreamingMessage() {
         applyCustomFontsToFontTags(mesText, msg.mes);
         return true;
     } finally {
-        if (streamingIdentity?.message === msg) streamingIdentity.lastText = String(msg.mes ?? '');
+        if (streamingIdentity?.message === msg) {
+            streamingIdentity.lastText = String(msg.mes ?? '');
+            streamingIdentity.thoughtSymbols = settings.thoughtSymbols;
+        }
         streamingSession.painting = false;
         observeStreamingTarget();
     }

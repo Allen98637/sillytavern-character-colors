@@ -2,7 +2,7 @@
 import { attributeDialogueSegments } from './attribution.js';
 import { ATTRIBUTION_SOURCE, isHostSystemOrToolMessage } from './attribution-store.js';
 import { resolveCharacterKeyByNameOrAlias } from './color-blocks.js';
-import { cancelMessageDomFollowupRepairs, clearMessageDomRepairTimer, clearStreamingAttributionOverrides, decorateMessageDomFromCurrentRender, deleteMessageQuoteOverride, getMessageIndexFromElement, getMessageQuoteOverrideEntry, getMessageQuoteOverrideOptions, isStreamingOwnedMessage, matchSegmentsToElements, refreshAndDecorateMessageDom, refreshMessageDom, resolveDomSegmentIndexForElement, restoreMessageQuoteOverrideEntry, scheduleMessageDomFollowupRepair, setMessageQuoteOverride } from './dom-engine.js';
+import { cancelMessageDomFollowupRepairs, clearMessageDomRepairTimer, clearStreamingAttributionOverrides, decorateMessageDomFromCurrentRender, deleteMessageQuoteOverride, getMessageAttributionFreezeSegments, getMessageIndexFromElement, getMessageQuoteOverrideEntry, getMessageQuoteOverrideOptions, isStreamingOwnedMessage, matchSegmentsToElements, refreshAndDecorateMessageDom, refreshMessageDom, resolveDomSegmentIndexForElement, restoreMessageQuoteOverrideEntry, scheduleMessageDomFollowupRepair, setMessageQuoteOverride } from './dom-engine.js';
 import { scheduleCustomFontRefresh } from './fonts.js';
 import { applyLiveColorChangesFromSnapshot, captureEffectiveColorSnapshot, commit, flushChatSave, parseCanonicalFontMarkup, queueChatSave, replaceCanonicalFontSpanColor } from './live-colors.js';
 import { buildCharacterEntry, getEntryEffectiveColor, setEntryFromEffectiveColor } from './palettes.js';
@@ -102,26 +102,6 @@ function getDomAttributionDetails(targetEl) {
     };
 }
 
-// The attribution heuristics carry speakers across neighbouring quotes, so
-// pinning one segment would otherwise re-colour the ones around it. Capture
-// what every other segment resolves to right now and store that alongside the
-// override, mirroring decoration's attribution options so the snapshot matches
-// the colours the user is looking at.
-function buildFrozenSiblingSegments(messageIndex, message, segmentIndex) {
-    const attribution = attributeDialogueSegments(message?.mes, message?.name, {
-        autoAddMessageSpeaker: true,
-        ...getMessageQuoteOverrideOptions(messageIndex, message),
-        mesIndex: messageIndex,
-    });
-    const frozen = {};
-    for (const segment of attribution.segments) {
-        if (segment.index === segmentIndex) continue;
-        const name = segment.assignment?.name || segment.assignment?.key;
-        if (name) frozen[String(segment.index)] = name;
-    }
-    return frozen;
-}
-
 function getDomAssignmentMessageId(message) {
     const id = message?.id ?? message?.send_date ?? '';
     return id === null || id === undefined ? '' : String(id);
@@ -136,6 +116,8 @@ function captureDomAssignmentTarget(targetEl, details) {
         message: details.message,
         messageId: getDomAssignmentMessageId(details.message),
         messageHash: hashMessageText(details.message.mes),
+        swipeId: details.message.swipe_id ?? null,
+        chat: getContext()?.chat,
         segmentIndex: details.segmentIndex,
         segmentText: details.segmentText,
         segmentDelimiter: details.segmentDelimiter,
@@ -148,7 +130,8 @@ function captureDomAssignmentTarget(targetEl, details) {
 function isDomAssignmentSourceCurrent(target) {
     if (!target) return false;
     const message = getContext()?.chat?.[target.messageIndex];
-    if (message !== target.message || getDomAssignmentMessageId(message) !== target.messageId
+    if (getContext()?.chat !== target.chat || message !== target.message
+        || (message?.swipe_id ?? null) !== target.swipeId || getDomAssignmentMessageId(message) !== target.messageId
         || hashMessageText(message?.mes) !== target.messageHash) return false;
     const attribution = attributeDialogueSegments(message.mes, message.name, {
         autoAddMessageSpeaker: false,
@@ -197,6 +180,7 @@ export function captureCanonicalFontAssignmentTarget(fontTag) {
         tagName: fontTag.tagName,
         messageIndex,
         message,
+        chat: getContext()?.chat,
         messageId: message.id ?? null,
         sendDate: message.send_date ?? null,
         swipeId: message.swipe_id ?? null,
@@ -211,7 +195,7 @@ export function captureCanonicalFontAssignmentTarget(fontTag) {
 export function isCanonicalFontAssignmentTargetCurrent(target) {
     if (!target) return false;
     const message = getContext()?.chat?.[target.messageIndex];
-    if (message !== target.message || message?.is_user || isHostSystemOrToolMessage(message)
+    if (getContext()?.chat !== target.chat || message !== target.message || message?.is_user || isHostSystemOrToolMessage(message)
         || (message?.id ?? null) !== target.messageId
         || (message?.send_date ?? null) !== target.sendDate
         || (message?.swipe_id ?? null) !== target.swipeId
@@ -226,6 +210,54 @@ export function isCanonicalFontAssignmentTargetCurrent(target) {
     return !!span && span.color === target.expectedColor
         && normalizeSegmentText(span.text) === target.expectedText
         && mapping.elements[target.fontOrdinal] === target.element;
+}
+
+export function applyCanonicalFontAssignment(target, color, options = {}) {
+    if (!isCanonicalFontAssignmentTargetCurrent(target)) return null;
+    const replacement = replaceCanonicalFontSpanColor(
+        target.message.mes, target.fontOrdinal, target.expectedColor, target.expectedText, color, options,
+    );
+    if (replacement) {
+        target.message.mes = replacement.updatedText;
+        syncActiveSwipeWithMessageText(target.message);
+    }
+    return replacement;
+}
+
+// Bare quotes (uncolored <q> outside the DOM engine) had no captured target:
+// the confirm handler re-read the chat by the element's stale index, so a chat
+// switch while the dialog was open modified the replacement message.
+export function captureBareQuoteAssignmentTarget(qElement) {
+    const messageIndex = getMessageIndexFromElement(qElement);
+    const message = getContext()?.chat?.[messageIndex];
+    if (!message || message.is_user || isHostSystemOrToolMessage(message)
+        || !Number.isInteger(messageIndex) || messageIndex < 0 || !qElement?.isConnected) return null;
+    return {
+        element: qElement,
+        tagName: qElement.tagName,
+        messageIndex,
+        message,
+        chat: getContext()?.chat,
+        messageId: message.id ?? null,
+        sendDate: message.send_date ?? null,
+        swipeId: message.swipe_id ?? null,
+        messageHash: hashMessageText(message.mes),
+        elementText: normalizeSegmentText(qElement.textContent),
+    };
+}
+
+export function isBareQuoteAssignmentTargetCurrent(target) {
+    if (!target) return false;
+    const message = getContext()?.chat?.[target.messageIndex];
+    if (getContext()?.chat !== target.chat || message !== target.message || message?.is_user || isHostSystemOrToolMessage(message)
+        || (message?.id ?? null) !== target.messageId
+        || (message?.send_date ?? null) !== target.sendDate
+        || (message?.swipe_id ?? null) !== target.swipeId
+        || hashMessageText(message?.mes) !== target.messageHash) return false;
+    if (!target.element?.isConnected || target.element.tagName !== target.tagName
+        || getMessageIndexFromElement(target.element) !== target.messageIndex
+        || normalizeSegmentText(target.element.textContent) !== target.elementText) return false;
+    return true;
 }
 
 function repaintDomAssignment(messageIndex, message, recoverDom) {
@@ -356,6 +388,11 @@ function showMenu(e, fontTag, qElement = null) {
         toast.warning('This font tag no longer maps to canonical saved message text.');
         return;
     }
+    const bareQuoteAssignmentTarget = isBareQuote ? captureBareQuoteAssignmentTarget(qElement) : null;
+    if (isBareQuote && !bareQuoteAssignmentTarget) {
+        toast.warning('Message changed; reopen the assignment menu.');
+        return;
+    }
     e.preventDefault?.();
     const opener = e.type === 'keydown' ? targetEl : document.activeElement;
     const attributionDetails = isDomSegment ? getDomAttributionDetails(targetEl) : null;
@@ -470,6 +507,11 @@ function showMenu(e, fontTag, qElement = null) {
             closeMenu();
             return;
         }
+        if (isBareQuote && !isBareQuoteAssignmentTargetCurrent(bareQuoteAssignmentTarget)) {
+            toast.warning('Message changed; reopen the assignment menu.');
+            closeMenu();
+            return;
+        }
         const targetMesIndex = isDomSegment
             ? domAssignmentTarget?.messageIndex
             : fontAssignmentTarget?.messageIndex ?? getMessageIndexFromElement(targetEl);
@@ -544,7 +586,7 @@ function showMenu(e, fontTag, qElement = null) {
                     mesIndex,
                     snapshot: JSON.parse(JSON.stringify(getMessageQuoteOverrideEntry(mesIndex, msg, false) || null)),
                 };
-                const freezeSegments = buildFrozenSiblingSegments(mesIndex, msg, segmentIndex);
+                const freezeSegments = getMessageAttributionFreezeSegments(mesIndex, msg, segmentIndex);
                 if (!setMessageQuoteOverride(mesIndex, msg, segmentIndex, name, { source: 'manual', freezeSegments })) {
                     toast.error('Could not save quote override.');
                     closeMenu();
@@ -556,19 +598,15 @@ function showMenu(e, fontTag, qElement = null) {
                 assignmentSucceeded = true;
                 domRepaintTarget = { mesIndex, msg, recoverDom };
             } else if (isBareQuote) {
-                textUpdated = wrapQElementWithFontTag(qElement, finalColor);
+                textUpdated = wrapQElementWithFontTag(qElement, finalColor, bareQuoteAssignmentTarget);
                 assignmentSucceeded = textUpdated;
             } else {
-                const replacement = replaceCanonicalFontSpanColor(
-                    fontAssignmentTarget.message.mes,
-                    fontAssignmentTarget.fontOrdinal,
-                    fontAssignmentTarget.expectedColor,
-                    fontAssignmentTarget.expectedText,
+                const replacement = applyCanonicalFontAssignment(
+                    fontAssignmentTarget,
                     finalColor,
                     { pendingEntries: [{ key, entry: nextEntry }] },
                 );
                 if (replacement) {
-                    fontAssignmentTarget.message.mes = replacement.updatedText;
                     textUpdated = replacement.changed;
                     assignmentSucceeded = true;
                 }
@@ -665,7 +703,10 @@ function showMenu(e, fontTag, qElement = null) {
                 else delete characterColors[installedKey];
             }
             if (overrideRollback) restoreMessageQuoteOverrideEntry(overrideRollback.mesIndex, overrideRollback.snapshot);
-            if (targetMessage && originalMessageText !== undefined) targetMessage.mes = originalMessageText;
+            if (targetMessage && originalMessageText !== undefined) {
+                targetMessage.mes = originalMessageText;
+                syncActiveSwipeWithMessageText(targetMessage);
+            }
             try {
                 if (installedKey) commit({ history: false });
                 scheduleCustomFontRefresh(0);
@@ -701,6 +742,7 @@ function showSelectionMenu(e, selection, range, selectedText, mesEl) {
     if (!msg || msg.is_user || isHostSystemOrToolMessage(msg)) return;
     e.preventDefault?.();
     const sourceMessageHash = hashMessageText(msg.mes);
+    const sourceSwipeId = msg.swipe_id ?? null;
     const selectedRangeText = range.toString();
     const capturedMesText = mesEl.querySelector('.mes_text');
     const renderedStartOffset = getRenderedCharOffset(capturedMesText, range);
@@ -770,7 +812,8 @@ function showSelectionMenu(e, selection, range, selectedText, mesEl) {
         // Validate the saved range before changing character state.
         // Streaming can replace the message while this dialog is open.
         const mesTextEl = mesEl.querySelector('.mes_text');
-        if (getContext()?.chat?.[msgIndex] !== msg
+        if (getContext()?.chat !== chat || getContext()?.chat?.[msgIndex] !== msg
+            || (msg.swipe_id ?? null) !== sourceSwipeId || msg.is_user || isHostSystemOrToolMessage(msg)
             || hashMessageText(msg.mes) !== sourceMessageHash
             || !range.startContainer?.isConnected
             || !mesTextEl?.contains(range.startContainer)
@@ -896,14 +939,21 @@ function syncManagedDialogueTabStops(messageRoots = null) {
     });
 }
 
-function resolveDialogueAssignmentTarget(source) {
+export function resolveDialogueAssignmentTarget(source) {
     const target = getEventElement(source);
     const mesText = target?.closest('.mes_text');
     if (!mesText) return null;
 
     if (isDomEngine()) {
-        const segmentEl = target.closest('[data-dc-seg], q, em');
+        let segmentEl = target.closest('[data-dc-seg], q, em');
         if (!segmentEl || !mesText.contains(segmentEl) || segmentEl.closest('font[color]')) return null;
+        // Nested emphasis inside a quote is not its own segment: clicking
+        // "must" in "You *must* listen." must target the enclosing quote,
+        // not the em wrapper that cannot map to a source segment.
+        if (segmentEl.tagName?.toUpperCase() === 'EM') {
+            const enclosing = segmentEl.parentElement?.closest('q, [data-dc-seg]');
+            if (enclosing && mesText.contains(enclosing)) segmentEl = enclosing;
+        }
         return { targetEl: segmentEl, fontTag: null, qElement: segmentEl };
     }
 
@@ -1321,7 +1371,9 @@ function isEscapedSourceCharacter(rawText, index) {
 
 function collectMarkdownMarkerRanges(rawText, excludedRanges = []) {
     const ranges = [];
-    const linkedLabel = /\[([^\]\r\n]+)\](?=\(|\[[^\]\r\n]*\])/g;
+    const heading = /^[ \t]{0,3}#{1,6}[ \t]+/gm;
+    for (const match of rawText.matchAll(heading)) ranges.push({ start: match.index, end: match.index + match[0].length });
+    const linkedLabel = /\[((?:[^\[\]\r\n]|\[[^\]\r\n]*\])+)\](?=\(|\[[^\]\r\n]*\])/g;
     let match;
     while ((match = linkedLabel.exec(rawText)) !== null) {
         ranges.push({ start: match.index, end: match.index + 1 });
@@ -1507,9 +1559,9 @@ function getOverlappingOccurrenceOrdinal(text, selection, offset) {
     return -1;
 }
 
-function getVisibleSourceOccurrenceSpans(rawText, sourceSelection, syntax) {
+function getVisibleSourceOccurrenceSpans(rawText, sourceSelection, syntax, renderedText) {
     const projection = [];
-    const sourceMap = [];
+    let sourceMap = [];
     const nonVisible = syntax.nonVisible || [];
     const replacements = [...(syntax.visibleReplacements || [])].sort((left, right) => left.start - right.start);
     let hiddenIndex = 0;
@@ -1517,6 +1569,11 @@ function getVisibleSourceOccurrenceSpans(rawText, sourceSelection, syntax) {
     for (let cursor = 0; cursor < rawText.length;) {
         while (hiddenIndex < nonVisible.length && nonVisible[hiddenIndex].end <= cursor) hiddenIndex++;
         while (replacementIndex < replacements.length && replacements[replacementIndex].end <= cursor) replacementIndex++;
+        const hidden = nonVisible[hiddenIndex];
+        if (hidden && cursor >= hidden.start && cursor < hidden.end) {
+            cursor = hidden.end;
+            continue;
+        }
         const replacement = replacements[replacementIndex];
         if (replacement?.start === cursor) {
             for (let index = 0; index < replacement.text.length; index++) {
@@ -1526,16 +1583,29 @@ function getVisibleSourceOccurrenceSpans(rawText, sourceSelection, syntax) {
             cursor = replacement.end;
             continue;
         }
-        const hidden = nonVisible[hiddenIndex];
-        if (hidden && cursor >= hidden.start && cursor < hidden.end) {
-            cursor = hidden.end;
-            continue;
-        }
         projection.push(rawText[cursor]);
         sourceMap.push({ start: cursor, end: cursor + 1 });
         cursor++;
     }
-    const visibleText = projection.join('');
+    let visibleText = projection.join('');
+    if (renderedText !== undefined && visibleText !== renderedText) {
+        const normalized = [];
+        const normalizedMap = [];
+        // Showdown joins paragraphs with one LF and normalises CRLF. Map a
+        // contracted separator to its whole source range, never one of its LFs.
+        for (const match of visibleText.matchAll(/(?:\r\n?|\n)(?:[ \t]*(?:\r\n?|\n))*|./gs)) {
+            normalized.push(/^[\r\n]/.test(match[0]) ? '\n' : match[0]);
+            normalizedMap.push({
+                start: sourceMap[match.index].start,
+                end: sourceMap[match.index + match[0].length - 1].end,
+            });
+        }
+        visibleText = normalized.join('');
+        sourceMap = normalizedMap;
+    }
+    // Equal occurrence counts do not establish correspondence after a macro or
+    // display rewrite. Require the entire modelled projection to agree.
+    if (renderedText !== undefined && visibleText !== renderedText) return [];
     const spans = [];
     let searchStart = 0;
     while (searchStart <= visibleText.length - sourceSelection.length) {
@@ -1560,7 +1630,8 @@ export function mapRenderedSelectionToSourceSpan(rawValue, renderedValue, select
     if (ordinal < 0) return null;
     const syntax = getRawSelectionSyntax(rawText);
     if (syntax.unsupportedProjection) return null;
-    const span = getVisibleSourceOccurrenceSpans(rawText, sourceSelection, syntax)[ordinal];
+    const spans = getVisibleSourceOccurrenceSpans(rawText, sourceSelection, syntax, renderedText);
+    const span = spans[ordinal];
     if (!span || rawText.slice(span.start, span.end) !== sourceSelection
         || overlapsAnySourceRange(syntax.unsafe, span.start, span.end)) return null;
     return span;
@@ -1574,6 +1645,18 @@ export function getRenderedOccurrenceOrdinal(rootEl, range, selectedText) {
     const offset = getRenderedCharOffset(rootEl, range);
     const renderedText = rootEl?.textContent || '';
     return getOverlappingOccurrenceOrdinal(renderedText, selection, offset);
+}
+
+// The host copies the current body into the active swipe only on outgoing
+// swipes of established chats; a fresh untouched greeting skips that copy.
+// When the extension rewrites message text, it must mirror the active swipe
+// itself or the edit silently reverts when the user swipes away and back.
+function syncActiveSwipeWithMessageText(message) {
+    const swipes = message?.swipes;
+    const activeIndex = message?.swipe_id;
+    if (!Array.isArray(swipes)) return;
+    if (!Number.isInteger(activeIndex) || activeIndex < 0 || activeIndex >= swipes.length) return;
+    swipes[activeIndex] = String(message.mes);
 }
 
 /**
@@ -1617,10 +1700,17 @@ export function replaceMessageSelectionWithFontTag(msg, selectedText, hexColor, 
     if (exactSourceText !== sourceSelection || overlapsAnySourceRange(syntax.unsafe, start, end)) return false;
 
     msg.mes = `${rawText.slice(0, start)}<font color="${normalizedColor}">${escapeHtml(exactSourceText)}</font>${rawText.slice(end)}`;
+    syncActiveSwipeWithMessageText(msg);
     return true;
 }
 
-export function wrapQElementWithFontTag(qElement, color) {
+export function wrapQElementWithFontTag(qElement, color, expectedTarget = null) {
+    // ponytail: a detached element keeps its old mesid, so never trust the index
+    // alone. With a captured target, reject a switched/swiped/edited message;
+    // without one (direct calls), at least refuse detached elements.
+    if (expectedTarget) {
+        if (qElement !== expectedTarget.element || !isBareQuoteAssignmentTargetCurrent(expectedTarget)) return false;
+    } else if (!qElement?.isConnected) return false;
     const msgIndex = getMessageIndexFromElement(qElement);
     if (msgIndex === -1) return false;
 
@@ -1652,6 +1742,7 @@ export function wrapQElementWithFontTag(qElement, color) {
 
     // Splice using exact source offsets — no regex, no HTML serialization.
     msg.mes = `${msg.mes.slice(0, targetSegment.start)}<font color="${newHex}">${msg.mes.slice(targetSegment.start, targetSegment.end)}</font>${msg.mes.slice(targetSegment.end)}`;
+    syncActiveSwipeWithMessageText(msg);
 
     // Re-render the full message block canonically. The re-render wipes our DOM
     // decorations, so the re-apply has to wait for it to settle or the gradient

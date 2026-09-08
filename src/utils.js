@@ -267,7 +267,7 @@ export function isCompositeSpeakerLabel(rawName) {
 export const HTML_TAG_QUOTE_MASK = '\ufffe';
 
 const HTML_VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
-const HTML_RAW_OR_CODE_ELEMENTS = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'iframe', 'noembed', 'noframes', 'plaintext', 'pre', 'code']);
+export const HTML_RAW_OR_CODE_ELEMENTS = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'iframe', 'noembed', 'noframes', 'plaintext', 'pre', 'code']);
 
 function findHtmlTagEnd(source, start) {
     let quote = '';
@@ -302,6 +302,7 @@ export function findHtmlTagRanges(text) {
     const ranges = [];
     const rawRanges = [];
     const stack = [];
+    const stackSignature = () => stack.map(item => `${item.name}\u0000${item.openStart}`);
     let cursor = 0;
     while (cursor < source.length) {
         const rawElement = stack.at(-1)?.raw ? stack.at(-1) : null;
@@ -318,10 +319,10 @@ export function findHtmlTagRanges(text) {
                 end: match.index + match[0].length,
                 name: rawElement.name,
                 closing: true,
-                stackBefore: stack.map(item => item.name),
+                stackBefore: stackSignature(),
             };
             stack.pop();
-            range.stackAfter = stack.map(item => item.name);
+            range.stackAfter = stackSignature();
             ranges.push(range);
             rawRanges.push({ start: rawElement.openStart, end: range.end });
             cursor = range.end;
@@ -333,7 +334,7 @@ export function findHtmlTagRanges(text) {
         if (source.startsWith('<!--', start)) {
             const commentEnd = source.indexOf('-->', start + 4);
             const end = commentEnd === -1 ? source.length : commentEnd + 3;
-            const signature = stack.map(item => item.name);
+            const signature = stackSignature();
             ranges.push({ start, end, name: '', closing: false, stackBefore: signature, stackAfter: signature });
             cursor = end;
             continue;
@@ -345,14 +346,15 @@ export function findHtmlTagRanges(text) {
         if (!match) { cursor = start + 1; continue; }
         const closing = !!match[1];
         const name = match[2].toLowerCase();
-        const range = { start, end, name, closing, stackBefore: stack.map(item => item.name) };
+        const range = { start, end, name, closing, stackBefore: stackSignature() };
         if (closing) {
             const owner = stack.map(item => item.name).lastIndexOf(name);
             if (owner >= 0) stack.length = owner;
-        } else if (!HTML_VOID_ELEMENTS.has(name) && !/\/\s*>$/.test(tag)) {
+        } else if (!HTML_VOID_ELEMENTS.has(name) && (!/\/\s*>$/.test(tag) || HTML_RAW_OR_CODE_ELEMENTS.has(name))) {
+            // HTML keeps raw/code elements open even when written as <code/>.
             stack.push({ name, raw: HTML_RAW_OR_CODE_ELEMENTS.has(name), openStart: start });
         }
-        range.stackAfter = stack.map(item => item.name);
+        range.stackAfter = stackSignature();
         ranges.push(range);
         cursor = end;
     }

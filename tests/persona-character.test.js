@@ -134,7 +134,7 @@ const {
     syncPinnedPersonaColors,
     tryLoadFromCard,
 } = await import('../src/storage.js');
-const { createRestoreSnapshot } = await import('../src/history.js');
+const { createRestoreSnapshot, undo, redo } = await import('../src/history.js');
 const { isReservedCharacterIdentity, renameGroupProfile } = await import('../src/group-profiles.js');
 // Saving replaces the registry object wholesale, so it has to be read off the module
 // namespace rather than captured once.
@@ -1056,6 +1056,36 @@ test('library-only style-pack install survives a chat and card context change', 
     }
 });
 
+test('a tiny style pack stays importable with a large saved colour history', async () => {
+    const previousRecord = structuredClone(stApi.extension_settings[state.MODULE_NAME]);
+    try {
+        setTestContext({ chat: [], chatMetadata: {}, characterId: 0, characters: [{ avatar: 'crowded.png' }] });
+        const entry = {
+            name: 'Cast', color: '#112233', baseColor: '#112233', locked: false, keep: false,
+            aliases: [], style: '', dialogueCount: 0, group: '', font: '', gradient: null, gradientGenerator: null,
+        };
+        const colorData = {};
+        for (let table = 0; table < 40; table++) {
+            const colors = {};
+            for (let index = 0; index < 50; index++) colors[`Cast${index}`] = { ...entry, name: `Cast${index}` };
+            colorData[`dc_chat_card_crowded.png_chat${table}`] = { colors, groupProfiles: {}, settings: {} };
+        }
+        stApi.extension_settings[state.MODULE_NAME] = { colorData };
+
+        const analysis = await analyzeStylePackImport(JSON.stringify({
+            format: 'dialogue-colors-style-pack',
+            formatVersion: 1,
+            metadata: { name: 'Tiny library' },
+            palettes: { Tiny: ['#112233', '#445566'] },
+        }));
+        assert.equal(analysis.ok, true);
+    } finally {
+        if (previousRecord === undefined) delete stApi.extension_settings[state.MODULE_NAME];
+        else stApi.extension_settings[state.MODULE_NAME] = previousRecord;
+        setTestContext({ chat: [], chatMetadata: {} });
+    }
+});
+
 test('style-pack replace with an empty assignment preset clears the table', async () => {
     const previousColors = structuredClone(registry());
     const previousFetch = globalThis.fetch;
@@ -1086,8 +1116,11 @@ test('style-pack replace with an empty assignment preset clears the table', asyn
         });
         assert.equal(result.ok, true);
         assert.deepEqual(Object.keys(registry()), []);
-        assert.equal(state.historyIndex, 0);
-        assert.equal(state.colorHistory.length, 1);
+        undo();
+        assert.deepEqual(Object.keys(registry()), ['alice']);
+        assert.equal(registry().alice.name, 'Alice');
+        redo();
+        assert.deepEqual(Object.keys(registry()), []);
     } finally {
         globalThis.fetch = previousFetch;
         state.setCharacterColors(previousColors);
@@ -1244,6 +1277,27 @@ test('a present persona edited while another is active updates its own pin', () 
         assert.equal(getPinnedPersonaColors().diego.baseColor, '#123456');
         assert.equal(getPinnedPersonaColors().marisol.baseColor, '#ff00aa');
         assert.equal(syncPinnedPersonaColors(), false);
+    });
+});
+
+test('a persona remembered through an alias row is restored from another persona', () => {
+    withPersona('Marisol', () => {
+        settings.persistPersonaColor = true;
+        setTestContext({ chat: [], chatMetadata: {}, name1: 'Marisol' });
+        // The persona's colour row is named Mari, tracked as Marisol only through an alias.
+        registry().mari = { name: 'Mari', aliases: ['Marisol'], baseColor: '#ff00aa', color: '#ff00aa' };
+        pinCurrentPersonaColor();
+        assert.equal(getPinnedPersonaColors().marisol.name, 'Mari');
+        for (const key of Object.keys(registry())) delete registry()[key];
+        setTestContext({ chat: [{ is_user: true, name: 'Marisol', mes: 'hi' }], chatMetadata: {}, name1: 'Diego' });
+        assert.equal(restorePinnedPersonaColor(), true);
+        assert.equal(registry().mari.baseColor, '#ff00aa');
+        assert.equal(registry().mari.name, 'Mari');
+        assert.deepEqual(registry().mari.aliases, ['Marisol']);
+        assert.deepEqual(Object.keys(registry()), ['mari']);
+        registry().mari.font = 'Noto Serif';
+        assert.equal(syncPinnedPersonaColors(), true);
+        assert.equal(getPinnedPersonaColors().marisol.font, 'Noto Serif');
     });
 });
 

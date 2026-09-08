@@ -225,6 +225,21 @@ test('the chat sweep repairs damaged messages and skips everything else', () => 
     });
 });
 
+test('user-authored overreaching spans are not re-scoped', () => {
+    withCleanRegistry(() => {
+        const authored = `<font color="${BOB}">"Hi", she said.</font>`;
+        const chat = [
+            { name: 'User', is_user: true, mes: authored },
+            { name: 'Bob', mes: `<font color="${BOB}">"Text", he says.</font>` },
+        ];
+        const report = repairOverreachingColorSpans(chat);
+
+        assert.deepEqual(report.repairedIndices, [1]);
+        assert.equal(chat[0].mes, authored, 'user messages are off limits');
+        assert.equal(chat[1].mes, `<font color="${BOB}">"Text"</font>, he says.`);
+    });
+});
+
 test('the LLM colorize path trims, and a manual recolor does not', () => {
     withCleanRegistry(() => {
         const raw = '"Text", he says, blah blah';

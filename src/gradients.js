@@ -405,7 +405,10 @@ export function buildRandomGradient(primaryColor, options = {}, random = Math.ra
             palette.splice(0, palette.length, ...remainingPalette);
             candidate = selectStopColor(stopContext, index, null);
         }
-        if (!candidate) throw new Error('Could not generate distinct gradient colors.');
+        if (!candidate) {
+            // ponytail: collapsed transforms get a flat segment, not an error.
+            candidate = selectedColors.at(-1);
+        }
         selectedColors.push(candidate);
         selectedRenderedColors.push(normalizeHex(transformColor(candidate), candidate));
 

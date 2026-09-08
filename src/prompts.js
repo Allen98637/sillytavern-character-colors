@@ -389,11 +389,14 @@ function collectUserPromptSources() {
     } catch {
         context = null;
     }
+    // The host treats the chat note as an override: when it exists at all,
+    // even empty, the global default is not used (authors-note.js). Scanning
+    // both would let an inactive default suppress injection via a stale macro.
+    const chatNote = context?.chatMetadata?.note_prompt;
     const sources = [
         power_user?.sysprompt?.content,
         power_user?.context?.story_string,
-        context?.chatMetadata?.note_prompt,
-        extension_settings?.note?.default,
+        chatNote !== null && chatNote !== undefined ? chatNote : extension_settings?.note?.default,
     ];
     let presetPrompts = null;
     try {

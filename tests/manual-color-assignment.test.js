@@ -53,7 +53,7 @@ const hooks = registerHooks({
 const stApi = await import(stApiUrl);
 const { getEntryEffectiveColor, setEntryFromEffectiveColor, syncAllEffectiveColors } = await import('../src/palettes.js');
 const { replaceCanonicalFontSpanColor, updateTextColorReferences } = await import('../src/live-colors.js');
-const { captureCanonicalFontAssignmentTarget, isCanonicalFontAssignmentTargetCurrent } = await import('../src/context-menu.js');
+const { applyCanonicalFontAssignment, captureBareQuoteAssignmentTarget, captureCanonicalFontAssignmentTarget, isBareQuoteAssignmentTargetCurrent, isCanonicalFontAssignmentTargetCurrent, replaceMessageSelectionWithFontTag, resolveDialogueAssignmentTarget, wrapQElementWithFontTag } = await import('../src/context-menu.js');
 const state = await import('../src/state.js');
 hooks.deregister();
 
@@ -195,6 +195,30 @@ test('right-click replacement rejects an ambiguous destination color', () => {
     });
 });
 
+test('canonical font assignment mirrors the selected host swipe and rejects stale targets', () => {
+    withRegistry(gradientEntry('Ivy'), () => {
+        const text = '<font color="#ff4d6d">"One"</font>';
+        const message = { name: 'Old', mes: text, swipe_id: 1, swipes: [text, 'older body'] };
+        const mesRoot = { getAttribute: () => '0' };
+        const mesText = { querySelectorAll: () => [font] };
+        const font = {
+            isConnected: true, tagName: 'FONT', textContent: '"One"',
+            getAttribute: () => '#ff4d6d',
+            closest: selector => selector === '.mes' ? mesRoot : mesText,
+        };
+        stApi.setTestContext({ chat: [message], chatMetadata: {} });
+        const target = captureCanonicalFontAssignmentTarget(font);
+        assert.ok(target);
+        assert.ok(applyCanonicalFontAssignment(target, getEntryEffectiveColor(state.characterColors.ivy))?.changed);
+        assert.equal(message.swipes[1], message.mes);
+        assert.equal(message.swipes[0], text);
+        message.swipe_id = 0;
+        assert.equal(applyCanonicalFontAssignment(target, '#123456'), null);
+        assert.equal(message.swipes[0], text);
+    });
+    stApi.setTestContext({ chat: [], chatMetadata: {} });
+});
+
 test('font assignment targeting fails closed when any rendered span diverges from source', () => {
     const message = {
         mes: '`<font color="#ff4d6d">"Code"</font>` <font color="#ff4d6d">"Live"</font>',
@@ -260,6 +284,47 @@ test('captured font assignments reject replaced, swiped, and edited messages', (
     stApi.setTestContext({ chat: [], chatMetadata: {} });
 });
 
+test('a stale bare-quote dialog cannot modify the replacement message', () => {
+    const original = { id: 'a', send_date: 'd1', swipe_id: 0, mes: '"Same"', name: 'Bob' };
+    const mesRoot = { getAttribute: name => name === 'mesid' ? '0' : null };
+    const qElement = {
+        isConnected: true,
+        tagName: 'Q',
+        textContent: '"Same"',
+        closest: selector => selector === '.mes' ? mesRoot : null,
+    };
+    stApi.setTestContext({ chat: [original], chatMetadata: {} });
+    const target = captureBareQuoteAssignmentTarget(qElement);
+    assert.ok(target, 'capture must succeed while the dialog source is current');
+    assert.equal(isBareQuoteAssignmentTargetCurrent(target), true);
+    stApi.setTestContext({ chat: [original], chatMetadata: {} });
+    assert.equal(isBareQuoteAssignmentTargetCurrent(target), false, 'even shared message objects belong to the captured chat');
+
+    // The dialog stays open while async host work replaces the chat: a different
+    // message now sits at index 0 carrying the same quote text.
+    const replacement = { id: 'b', send_date: 'd2', swipe_id: 0, mes: '"Same"', name: 'Carol' };
+    stApi.setTestContext({ chat: [replacement], chatMetadata: {} });
+    assert.equal(isBareQuoteAssignmentTargetCurrent(target), false, 'a switched chat must read as stale');
+    assert.equal(wrapQElementWithFontTag(qElement, '#123456', target), false);
+    assert.equal(replacement.mes, '"Same"', 'the replacement message must be untouched');
+    stApi.setTestContext({ chat: [], chatMetadata: {} });
+});
+
+test('a detached bare-quote element refuses direct wrapping', () => {
+    const message = { mes: '"Same"', name: 'Bob' };
+    const mesRoot = { getAttribute: name => name === 'mesid' ? '0' : null };
+    const qElement = {
+        isConnected: false,
+        tagName: 'Q',
+        textContent: '"Same"',
+        closest: selector => selector === '.mes' ? mesRoot : null,
+    };
+    stApi.setTestContext({ chat: [message], chatMetadata: {} });
+    assert.equal(wrapQElementWithFontTag(qElement, '#123456'), false);
+    assert.equal(message.mes, '"Same"');
+    stApi.setTestContext({ chat: [], chatMetadata: {} });
+});
+
 test('message re-renders chain the decoration re-apply after they settle', () => {
     // refreshMessageDom re-renders mes_text from msg.mes, wiping the extension's gradient
     // classes and CSS vars. It resolves only once the re-render has settled, so a
@@ -286,4 +351,55 @@ test('persistent assignment paths await chat save confirmation', () => {
     assert.equal((contextMenu.match(/const chatSaveConfirmation = flushChatSave\(\)/g) || []).length, 2);
     assert.equal((contextMenu.match(/await chatSaveConfirmation/g) || []).length, 2);
     assert.doesNotMatch(contextMenu, /^\s+flushChatSave\(\);/m);
+});
+
+test('nested emphasis inside a quote resolves to the enclosing quote', () => {
+    const previous = state.settings.coloringEngine;
+    state.settings.coloringEngine = 'dom';
+    const quote = { closest: selector => selector === 'q, [data-dc-seg]' ? quote : null };
+    const mesText = { contains: () => true };
+    const emphasis = {
+        tagName: 'EM', parentElement: quote,
+        closest: selector => selector === '.mes_text' ? mesText : selector === 'font[color]' ? null : emphasis,
+    };
+    try {
+        assert.equal(resolveDialogueAssignmentTarget(emphasis)?.targetEl, quote);
+        quote.closest = () => null;
+        assert.equal(resolveDialogueAssignmentTarget(emphasis)?.targetEl, emphasis, 'standalone thoughts remain selectable');
+    } finally {
+        state.settings.coloringEngine = previous;
+    }
+});
+
+test('selection and bare quote writes update the active top-level host swipe only', () => {
+    for (const active of [0, 1]) {
+        const message = { name: 'Bob', mes: '"Same"', swipe_id: active, swipes: ['"Same"', '"Same"'], swipe_info: [{ extra: {} }, { extra: {} }] };
+        const beforeInfo = structuredClone(message.swipe_info);
+        assert.equal(replaceMessageSelectionWithFontTag(message, 'Same', '#123456'), true);
+        assert.equal(message.swipes[active], message.mes);
+        assert.equal(message.swipes[1 - active], '"Same"');
+        assert.deepEqual(message.swipe_info, beforeInfo);
+
+        message.mes = '"Same"';
+        message.swipes[active] = message.mes;
+        const mesRoot = { getAttribute: () => '0', querySelector: () => mesText };
+        const quote = { tagName: 'Q', isConnected: true, textContent: '"Same"', closest: () => mesRoot };
+        const mesText = { querySelectorAll: () => [quote] };
+        stApi.setTestContext({ chat: [message], chatMetadata: {} });
+        assert.equal(wrapQElementWithFontTag(quote, '#123456'), true);
+        assert.equal(message.swipes[active], message.mes);
+        assert.equal(message.swipes[1 - active], '"Same"');
+    }
+    stApi.setTestContext({ chat: [], chatMetadata: {} });
+});
+
+test('every message rewrite mirrors the active swipe text', () => {
+    // The host only copies the current body into the active swipe on outgoing
+    // swipes of established chats; a fresh untouched greeting skips that copy.
+    // Every site that rewrites msg.mes must sync the swipe itself or the edit
+    // silently reverts on swipe-back.
+    assert.match(contextMenu, /function syncActiveSwipeWithMessageText/);
+    assert.equal((contextMenu.match(/syncActiveSwipeWithMessageText\(msg\)/g) || []).length, 2);
+    assert.match(contextMenu, /syncActiveSwipeWithMessageText\(target\.message\)/);
+    assert.match(contextMenu, /syncActiveSwipeWithMessageText\(targetMessage\)/);
 });

@@ -6,7 +6,7 @@ import { normalizeRegistryIdentity, normalizeRegistryIdentityName } from './grou
 import { formatColorBlockPair } from './prompts.js';
 import { escapeRegex } from './st-api.js';
 import { characterColors, streamingSession } from './state.js';
-import { buildMaskedDialogueText, findHtmlTagRanges, getDialogueParagraphRange, getPrecedingParagraphRange, isCompositeSpeakerLabel, isSameDialogueParagraph, makeLengthPreservingSearchText, maskHtmlTagQuotes, normalizeSegmentText, splitsHtmlTag } from './utils.js';
+import { buildMaskedDialogueText, findHtmlTagRanges, getDialogueParagraphRange, getPrecedingParagraphRange, isCompositeSpeakerLabel, isSameDialogueParagraph, makeLengthPreservingSearchText, normalizeSegmentText, splitsHtmlTag } from './utils.js';
 
 // Invalidates derived caches (speaker mention regexes). Called on chat change and UI init.
 export function clearDomCache() { clearSpeakerRegexCache(); }
@@ -589,17 +589,40 @@ function createSegmentProvenance(source, method, confidence, evidence) {
     };
 }
 
+function maskAttributionMarkup(text) {
+    const chars = text.split('');
+    let ranges = findHtmlTagRanges(text);
+    const mask = range => {
+        for (let index = range.start; index < range.end; index++) {
+            if (chars[index] !== '\n' && chars[index] !== '\r') chars[index] = ' ';
+        }
+    };
+    const code = /```[\s\S]*?```|~~~[\s\S]*?~~~|``[\s\S]*?``|`[\s\S]*?`/g;
+    let match;
+    while ((match = code.exec(text)) !== null) {
+        const hidden = [...ranges.rawRanges, ...ranges].find(range => match.index >= range.start && match.index < range.end);
+        if (hidden) {
+            code.lastIndex = hidden.end;
+            continue;
+        }
+        const end = match.index + match[0].length;
+        mask({ start: match.index, end });
+        // Literal tags inside code must not affect later HTML scope. Reparse
+        // only when code actually hid a tag, rather than on every code span.
+        if (ranges.some(range => range.start >= match.index && range.start < end)) ranges = findHtmlTagRanges(chars.join(''));
+    }
+    for (const range of [...ranges, ...ranges.rawRanges]) mask(range);
+    return chars.join('');
+}
+
 // Mirrors SillyTavern's balanceStreamingMarkdown: it closes an odd delimiter
 // before formatting, so a half-typed quote is already a complete <q> in the DOM.
 // Parsing the unbalanced text instead leaves us one segment short every tick,
 // which shifts indices and re-targets matches.
 export function balanceStreamingText(text) {
     let balanced = String(text ?? '');
+    const counted = maskAttributionMarkup(balanced);
     for (const char of ['*', '"']) {
-        // An attribute's quotes are not dialogue delimiters, so they must not tip the parity
-        // count: <img src="x.png"> alone would otherwise read as balanced speech, and a half
-        // written tag would have a closing quote appended into the middle of it.
-        const counted = char === '"' ? maskHtmlTagQuotes(balanced) : balanced;
         let count = 0;
         for (let i = 0; i < counted.length; i++) {
             if (counted[i] === char) count++;
@@ -617,10 +640,9 @@ export function attributeDialogueSegments(rawText, messageSpeakerName = '', opti
     const raw = options.streaming === true
         ? balanceStreamingText(rawText)
         : String(rawText ?? '');
-    // Scanned masked, sliced unmasked: maskHtmlTagQuotes is length preserving, so an offset
-    // found in scanned addresses the same byte of raw. The host hides an attribute's quotes
-    // from its own <q> pass the same way, so this keeps segment indices in step with it.
-    const scanned = maskHtmlTagQuotes(raw);
+    // Mask every hidden delimiter before numbering, retaining source offsets
+    // and line boundaries. Segment text is still sliced from the original.
+    const scanned = maskAttributionMarkup(raw);
     const localAssignments = parseNamedColorAssignmentsFromText(raw);
     const lookup = buildNameColorLookup(localAssignments);
     const sortedLookupKeys = Array.from(lookup.keys())
@@ -678,12 +700,12 @@ export function attributeDialogueSegments(rawText, messageSpeakerName = '', opti
         });
     }
 
-    const maskedText = buildMaskedDialogueText(raw, collectedSegments);
+    const maskedText = buildMaskedDialogueText(scanned, collectedSegments);
     // Models very often put the acting character's name inside the action
     // itself ("*Bob shrugs.* \"Fine.\""). maskedText blanks emphasis along with
     // quotes, so the paragraph-subject tier reads a text where only real
     // speech is hidden and narration -- asterisked or not -- is still legible.
-    const narrationText = buildMaskedDialogueText(raw, collectedSegments.filter(segment => segment.delimiter !== '*' && segment.delimiter !== '_'));
+    const narrationText = buildMaskedDialogueText(scanned, collectedSegments.filter(segment => segment.delimiter !== '*' && segment.delimiter !== '_'));
     // Four deep rather than two: a three-way scene used to evict the third
     // speaker before it could ever be alternated back to. Selection still
     // walks backwards to the most recent distinct key, so two-speaker

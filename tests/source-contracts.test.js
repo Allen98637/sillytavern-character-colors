@@ -753,14 +753,13 @@ test('persona pins and the card character are synced where every save and load a
     // Load order: Keep pins, then persona pins over them, then the card character marked
     // Kept, and any of the three is enough to persist.
     assert.match(load, /restorePinnedCharacters\(\);[\s\S]*?restorePinnedPersonaColor\(\);[\s\S]*?markCurrentPersonaKept\(\);[\s\S]*?markCardCharactersKept\(\);/);
-    assert.match(load, /personaKept \|\| cardKept\)/);
+    assert.match(load, /personaKept \|\| cardKept \|\| unkeptReconciled\)/);
     // The card character is Kept on creation the way Lock is, and imports keep their own flag.
     assert.match(build, /keep: !!options\.keep \|\| \(!bypassAutomation && shouldAutoKeepCardCharacter\(trimmedName\)\)/);
 });
 
-test('the tool-call repair reverses only this extension own canonical markup', () => {
+test('tool-call repair preserves the registry and reverses only canonical markup', () => {
     const restore = functionSection(sources['live-colors.js'], 'restoreColorizedToolCallText');
-    const sweep = functionSection(sources['live-colors.js'], 'removeUnreferencedCharacterEntries');
     const repair = functionSection(sources['live-colors.js'], 'repairColorizedToolCallMessages');
     const chatChanged = functionSection(sources['main.js'], 'handleChatChanged');
 
@@ -771,10 +770,10 @@ test('the tool-call repair reverses only this extension own canonical markup', (
     assert.doesNotMatch(restore, /stripFontTags|stripColorBlocks\(/);
     assert.match(repair, /isToolCallMessage\(msg\)/);
 
-    // Keep is the only protection: processColorPairs creates detected entries locked by
-    // default, so a lock guard would refuse to clean up every entry the bug made.
-    assert.match(sweep, /entry\.keep === true/);
-    assert.doesNotMatch(sweep, /entry\.locked/);
+    // Absence from this chat cannot prove an entry in a shared table was erroneous.
+    // Repair only message text, regardless of the character's Keep or Lock flags.
+    assert.match(repair, /removedCharacterKeys:\s*\[\]/);
+    assert.doesNotMatch(repair, /characterColors|removeUnreferencedCharacterEntries/);
 
     // The repair must sit behind the disabled bail, and ahead of the display strip that would
     // otherwise hide the evidence it looks for.

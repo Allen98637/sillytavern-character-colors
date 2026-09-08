@@ -43,7 +43,6 @@ async function loadLiveColorsModule(overrides = {}) {
     globalThis[key] = {
         LIVE_CHAT_SAVE_DELAY_MS: 15,
         COLOR_STATE_SAVE_DELAY_MS: 15,
-        CHAT_SAVE_OPERATION_TIMEOUT_MS: 50,
         liveChatSaveTimer: null,
         colorStateSaveTimer: null,
         characterColors: {},
@@ -111,7 +110,27 @@ async function loadLiveColorsModule(overrides = {}) {
         ...overrides,
     };
     const importedNames = [...names].join(', ');
-    const transformed = `const { ${importedNames} } = globalThis[${JSON.stringify(key)}];\n${source.replace(importPattern, '')}`;
+    // The transform destructures imports once, which freezes scalar state like
+    // isAutoColorizing. Tests that need a live binding declare it under
+    // overrides.liveState: { name: () => currentValue } and the module source
+    // re-reads it through that getter at every use.
+    const liveState = overrides.liveState ?? null;
+    let liveSetup = '';
+    let transformedSource = source.replace(importPattern, '');
+    // Exercise the real bounded retry policy without leaving 30-second timers
+    // alive after assertions finish.
+    transformedSource = transformedSource
+        .replace('CHAT_SAVE_RETRY_BASE_DELAY_MS = 1000', 'CHAT_SAVE_RETRY_BASE_DELAY_MS = 20')
+        .replace('CHAT_SAVE_OPERATION_TIMEOUT_MS = 15000', 'CHAT_SAVE_OPERATION_TIMEOUT_MS = 1000')
+        .replace('CHAT_SAVE_UNCERTAIN_RETRY_DELAY_MS = 30000', 'CHAT_SAVE_UNCERTAIN_RETRY_DELAY_MS = 30');
+    if (liveState) {
+        liveSetup = `const __dcStubs = globalThis[${JSON.stringify(key)}];\n`;
+        for (const name of Object.keys(liveState)) {
+            liveSetup += `const __dcLive_${name} = () => __dcStubs.liveState['${name}']();\n`;
+            transformedSource = transformedSource.replaceAll(new RegExp(`\\b${name}\\b`, 'g'), `__dcLive_${name}()`);
+        }
+    }
+    const transformed = `const { ${importedNames} } = globalThis[${JSON.stringify(key)}];\n${liveSetup}${transformedSource}`;
     try {
         return await import(`data:text/javascript;base64,${Buffer.from(transformed).toString('base64')}#${moduleSequence}`);
     } finally {
@@ -244,6 +263,55 @@ test('a fulfilled void host save is accepted and never warned as failed', async 
     await delay(30);
     assert.equal(saves, 1, 'void settlement must not trigger an endless confirmation retry');
 });
+
+for (const recovery of ['resume', 'flush', 'new edit', 'reused array']) {
+    test(`a pending revision is not replaced by reloaded content through ${recovery}`, async () => {
+        const blocker = deferred();
+        const queued = [{ mes: 'queued colour edit' }];
+        const replacement = [{ mes: 'original from disk' }];
+        let pending = false;
+        let generation = 0;
+        const saves = [];
+        const save = async function () { saves.push(structuredClone(this.chat)); return true; };
+        let context = chatContext('blocker', [], () => blocker.promise);
+        const live = await loadLiveColorsModule({
+            getContext: () => context,
+            setPendingLiveChatSave: value => { pending = value; },
+            liveState: { attributionChatGeneration: () => generation },
+        });
+
+        live.queueChatSave();
+        context = chatContext('chat-a', queued, save);
+        live.queueChatSave();
+        context = chatContext('chat-a', replacement, save);
+        generation++;
+        if (recovery === 'reused array') {
+            queued.splice(0, queued.length, ...replacement);
+            context.chat = queued;
+        }
+        blocker.resolve(true);
+        await delay(20);
+        assert.equal(saves.length, 0, 'the gate must not dispatch the reloaded original');
+        assert.equal(pending, true);
+
+        if (recovery === 'resume') assert.equal(live.resumePendingChatSave(), false);
+        if (recovery === 'flush') assert.equal(await live.flushChatSave(), false);
+        if (recovery === 'new edit' || recovery === 'reused array') {
+            context.chat[0].mes = 'new branch edit';
+            live.queueChatSave();
+            await live.flushChatSave();
+            assert.deepEqual(saves, [[{ mes: 'new branch edit' }]]);
+        }
+        await delay(30);
+        assert.equal(pending, true, 'saving another revision must not clear the unsent edit');
+
+        context = chatContext('chat-a', [{ mes: 'queued colour edit' }], save);
+        assert.equal(live.resumePendingChatSave(), true);
+        await waitFor(() => saves.at(-1)?.[0].mes === 'queued colour edit');
+        await waitFor(() => pending === false);
+        assert.equal(context.chat[0].mes, 'queued colour edit');
+    });
+}
 
 test('a host save that resolves no usable verdict is treated as confirmed for toasts', async () => {
     let saves = 0;
@@ -396,14 +464,51 @@ test('individual and batch LLM colorization use one filtered speaker table', asy
     }
 });
 
+test('batch LLM colorization names each message author separately', async () => {
+    const requests = [];
+    const live = await loadLiveColorsModule({
+        generateQuietPrompt() {},
+        characterColors: {
+            alice: { name: 'Alice', color: '#123456', aliases: [] },
+            bob: { name: 'Bob', color: '#654321', aliases: [] },
+        },
+        getNarratorVisual: () => null,
+        getThoughtDelimiterSymbols: () => [],
+        buildLLMColorizeRules: () => [],
+        callLLMWithProfile: async instruction => {
+            requests.push(instruction);
+            return '';
+        },
+    });
+
+    await live.colorizeMultipleMessagesWithLLM([
+        { rawText: '"Hello."', speakerName: 'Alice', msgIndex: 0 },
+        { rawText: '"Hello."', speakerName: 'Bob', msgIndex: 1 },
+    ]);
+
+    assert.equal(requests.length, 1);
+    const instruction = requests[0];
+    // Identical texts must still carry their own author lines, or the model
+    // cannot tell whose reply each block is.
+    assert.equal((instruction.match(/Default speaker \(message author\):/g) || []).length, 2);
+    assert.match(instruction, /Default speaker \(message author\): Alice=#123456\./);
+    assert.match(instruction, /Default speaker \(message author\): Bob=#654321\./);
+});
+
 test('bulk colorization rechecks tool eligibility after the provider await', async () => {
     const request = deferred();
     const chat = [{ name: 'Alice', is_user: false, extra: {}, mes: '"Hello."' }];
     let started = false;
-    const live = await loadLiveColorsModule(bulkColorizeStubs(chat, () => {
+    let completions = 0;
+    const stubs = bulkColorizeStubs(chat, () => {
         started = true;
         return request.promise;
-    }));
+    });
+    stubs.attributeDialogueSegments = () => {
+        completions++;
+        return { segments: [], createdCharacters: true };
+    };
+    const live = await loadLiveColorsModule(stubs);
 
     const run = live.colorizeMessages('all');
     await waitFor(() => started);
@@ -412,6 +517,7 @@ test('bulk colorization rechecks tool eligibility after the provider await', asy
     await run;
 
     assert.equal(chat[0].mes, '"Hello."');
+    assert.equal(completions, 0, 'stale batch results cannot reach character-creating completion');
 });
 
 test('effective narrator changes invalidate an in-flight colorize run without registry entries', async () => {
@@ -516,7 +622,8 @@ function completionStubs(chat, onSync) {
             narratorSeen: false,
         }),
         syncDialogueCounts: syncedChat => { onSync(syncedChat[0].mes); return false; },
-        collectFontColorsFromText: text => new Set((String(text).match(/#123456/g) || [])),
+        collectFontColorsFromText: text => new Set([...String(text).matchAll(/<font color="(#[0-9a-f]{6})">/gi)].map(match => match[1])),
+        parseNamedColorAssignmentsFromText: () => [],
         attributeDialogueSegments: text => ({
             segments: ['"One."', '"Two."'].flatMap(quote => {
                 const start = text.indexOf(quote);
@@ -557,6 +664,62 @@ test('the dialogue tally is taken after local completion rewrites the message, n
     assert.equal(synced.at(-1).split('<font').length - 1, 2, 'the locally completed line is counted too');
 });
 
+for (const change of ['disable', 'disable plain', 'disable recolor', 'edit recolor', 'edit', 'replace', 'delete', 'swipe', 'tool', 'scope', 'generation']) {
+    test(`remap completion does not create characters or rewrite after ${change} during save`, async () => {
+        const saveRequest = deferred();
+        const message = { name: 'Alice', is_user: false, extra: {}, mes: '<font color="#aaaaaa">"One."</font> "Two."' };
+        const chat = [message];
+        let saves = 0;
+        let completions = 0;
+        let registrations = 0;
+        let scope = 'chat-a';
+        let generation = 0;
+        const stubs = completionStubs(chat, () => {});
+        if (change === 'disable plain') message.mes = '"One."\n[COLORS:Alice=#aaaaaa]';
+        if (change.endsWith('recolor')) {
+            stubs.settings.autoRecolor = true;
+            chat.push({ name: 'Alice', is_user: false, extra: {}, mes: '<font color="#aaaaaa">"Older."</font>' });
+        }
+        Object.assign(stubs, {
+            getContext: () => chatContext('chat-a', chat, () => { saves++; return saveRequest.promise; }),
+            getStorageKey: () => scope,
+            liveState: { attributionChatGeneration: () => generation },
+            processColorBlocksInText: () => ({
+                foundColorBlock: true, foundNew: false, hadRemapping: true,
+                remappedAssignments: [{ oldColor: '#aaaaaa', newColor: '#123456' }],
+            }),
+            parseColorAssignmentsFromText: () => ({ namesByColor: { '#aaaaaa': new Set(['alice']) }, latestByColor: { '#aaaaaa': 'alice' } }),
+            syncAllEffectiveColors() {},
+            setIsRecoloring() {},
+            setRecolorButtonBusy() {},
+            ensureCharacterEntry() { registrations++; return { created: true }; },
+            attributeDialogueSegments() {
+                completions++;
+                return { segments: [], createdCharacters: true };
+            },
+        });
+        const live = await loadLiveColorsModule(stubs);
+        live.onNewMessage(0, message, chat);
+        await waitFor(() => saves === 1, 2000);
+        assert.match(message.mes, /#123456/);
+        if (change.startsWith('disable')) stubs.settings.enabled = false;
+        if (change.startsWith('edit')) message.mes = 'edited while saving';
+        if (change === 'replace') chat[0] = { ...message };
+        if (change === 'delete') chat.length = 0;
+        if (change === 'swipe') message.swipe_id = 1;
+        if (change === 'tool') message.extra.tool_invocations = [];
+        if (change === 'scope') scope = 'chat-b';
+        if (change === 'generation') generation++;
+        const expected = structuredClone(chat);
+        saveRequest.resolve(true);
+        await delay(80);
+        assert.equal(completions, 0, 'stale work must not reach character-creating completion');
+        assert.equal(registrations, 0, 'stale work must not register speakers');
+        assert.equal(saves, change === 'disable recolor' ? 2 : 1);
+        assert.deepEqual(chat, expected);
+    });
+}
+
 test('profile prompt mode colorizes each reply through the colorize profile', async () => {
     const message = { name: 'Alice', is_user: false, extra: {}, mes: 'Alice said "Hello."' };
     const chat = [message];
@@ -593,3 +756,172 @@ test('profile prompt mode colorizes each reply through the colorize profile', as
     await waitFor(() => requests.length === 1, 2000);
     assert.equal(requests.length, 1);
 });
+
+test('profile prompt mode colors replies that carry only a metadata block', async () => {
+    const message = { name: 'Alice', is_user: false, extra: {}, mes: 'Alice said "Hello."\n[COLORS:Alice=#123456]' };
+    const chat = [message];
+    const requests = [];
+    const stubs = completionStubs(chat, () => {});
+    Object.assign(stubs, {
+        settings: { ...stubs.settings, autoColorize: false, completePartialColorize: false },
+        getEffectivePromptMode: () => 'profile',
+        // The model echoed the colour block but wrote no font tags. The block alone
+        // does not colour dialogue, so the separate colouring step must still run.
+        processColorBlocksInText: () => ({
+            foundColorBlock: true,
+            foundNew: false,
+            hadRemapping: false,
+            remappedAssignments: [],
+            narratorSeen: false,
+        }),
+        collectFontColorsFromText: () => new Set(),
+        generateQuietPrompt: async () => '',
+        callLLMWithProfile: async instruction => { requests.push(instruction); return ''; },
+        setIsAutoColorizing() {},
+        showAutoColorizeIndicator() {},
+        hideAutoColorizeIndicator() {},
+        clearAutoColorizeIndicators() {},
+        syncAllEffectiveColors() {},
+        buildLLMColorizeRules: () => [],
+        getThoughtDelimiterSymbols: () => [],
+        formatColorBlockPair: (name, color) => `${name}=${color}`,
+        colorizeMessageText: rawText => ({ updatedText: rawText, changed: false, createdCharacters: false, hadDialogueMatches: false, hadResolvableSpeaker: false }),
+    });
+    const live = await loadLiveColorsModule(stubs);
+
+    live.onNewMessage(0, message, chat);
+    await waitFor(() => requests.length === 1, 2000);
+    assert.equal(requests.length, 1, 'metadata alone must not count as coloured output');
+});
+
+function queuedColorizeStubs(chat, instructions, pendingRequests) {
+    let colorizing = false;
+    const stubs = completionStubs(chat, () => {});
+    Object.assign(stubs, {
+        settings: { ...stubs.settings, autoColorize: false, completePartialColorize: false },
+        getEffectivePromptMode: () => 'profile',
+        processColorBlocksInText: () => ({
+            foundColorBlock: false,
+            foundNew: false,
+            hadRemapping: false,
+            remappedAssignments: [],
+            narratorSeen: false,
+        }),
+        collectFontColorsFromText: () => new Set(),
+        generateQuietPrompt: async () => '',
+        callLLMWithProfile: async instruction => {
+            instructions.push(instruction);
+            return pendingRequests[instructions.length - 1].promise;
+        },
+        isAutoColorizing: false,
+        liveState: { isAutoColorizing: () => colorizing },
+        setIsAutoColorizing(value) { colorizing = value; },
+        showAutoColorizeIndicator() {},
+        hideAutoColorizeIndicator() {},
+        clearAutoColorizeIndicators() {},
+        syncAllEffectiveColors() {},
+        buildLLMColorizeRules: () => [],
+        getThoughtDelimiterSymbols: () => [],
+        formatColorBlockPair: (name, color) => `${name}=${color}`,
+        colorizeMessageText: rawText => ({ updatedText: rawText, changed: false, createdCharacters: false, hadDialogueMatches: false, hadResolvableSpeaker: false }),
+    });
+    return stubs;
+}
+
+test('a busy colorize replays every reply that arrived in between, not just the newest', async () => {
+    const A = { name: 'Alice', is_user: false, extra: {}, mes: 'Alice said "One."' };
+    const B = { name: 'Alice', is_user: false, extra: {}, mes: 'Alice said "Two."' };
+    const C = { name: 'Alice', is_user: false, extra: {}, mes: 'Alice said "Three."' };
+    const chat = [A, B, C];
+    const instructions = [];
+    const pendingRequests = [deferred(), deferred(), deferred()];
+    const stubs = queuedColorizeStubs(chat, instructions, pendingRequests);
+    const live = await loadLiveColorsModule(stubs);
+
+    live.onNewMessage(0, A, chat);
+    await waitFor(() => instructions.length === 1, 2000);
+    // B and C arrive while A's request is still pending. Their debounce timers
+    // must fire before A resolves so the busy gates really queue them.
+    live.onNewMessage(1, B, chat);
+    live.onNewMessage(2, C, chat);
+    await delay(800);
+
+    pendingRequests[0].resolve('');
+    await waitFor(() => instructions.length === 2, 3000);
+    pendingRequests[1].resolve('');
+    await waitFor(() => instructions.length === 3, 3000);
+    pendingRequests[2].resolve('');
+    await waitFor(() => !stubs.liveState.isAutoColorizing(), 3000);
+
+    assert.equal(instructions.length, 3, 'every reply that arrived while busy gets its own colorize run');
+    assert.ok(instructions[0].includes('"One."'), 'first reply colorized first');
+    assert.ok(instructions[1].includes('"Two."'), 'intermediate reply is not forgotten');
+    assert.ok(instructions[2].includes('"Three."'), 'last reply still colorized');
+});
+
+for (const change of ['edit', 'delete', 'replace', 'swipe', 'tool']) {
+    test(`a stale first queued reply after ${change} cannot strand a later valid reply`, async () => {
+        const chat = ['One', 'Two', 'Three'].map(word => ({ name: 'Alice', is_user: false, extra: {}, mes: `"${word}."` }));
+        const instructions = [];
+        const pendingRequests = [deferred(), deferred()];
+        const stubs = queuedColorizeStubs(chat, instructions, pendingRequests);
+        const live = await loadLiveColorsModule(stubs);
+
+        live.onNewMessage(0, chat[0], chat);
+        await waitFor(() => instructions.length === 1, 2000);
+        live.onNewMessage(1, chat[1], chat);
+        live.onNewMessage(2, chat[2], chat);
+        await delay(800);
+        if (change === 'edit') chat[1].mes = 'Edited';
+        if (change === 'delete') delete chat[1];
+        if (change === 'replace') chat[1] = { ...chat[1] };
+        if (change === 'swipe') chat[1].swipe_id = 1;
+        if (change === 'tool') chat[1].extra.tool_invocations = [];
+        const expected = structuredClone(chat);
+        pendingRequests[0].resolve('');
+        await waitFor(() => instructions.length === 2, 3000);
+        assert.ok(instructions[1].includes('"Three."'));
+        pendingRequests[1].resolve('');
+        await waitFor(() => !stubs.liveState.isAutoColorizing());
+        await delay(700);
+        assert.equal(instructions.length, 2, 'stale snapshots are consumed, never retried indefinitely');
+        assert.deepEqual(chat, expected);
+    });
+}
+
+for (const change of ['generation', 'scope', 'settings', 'prompt mode']) {
+    test(`queued replies retain their captured ${change} through replay`, async () => {
+        const chat = ['One', 'Two', 'Three'].map(word => ({ name: 'Alice', is_user: false, extra: {}, mes: `"${word}."` }));
+        const instructions = [];
+        const pendingRequests = [deferred(), deferred()];
+        let generation = 0;
+        let scope = 'chat-a';
+        let promptMode = 'profile';
+        const stubs = queuedColorizeStubs(chat, instructions, pendingRequests);
+        stubs.liveState.attributionChatGeneration = () => generation;
+        stubs.getStorageKey = () => scope;
+        stubs.getEffectivePromptMode = () => promptMode;
+        const live = await loadLiveColorsModule(stubs);
+
+        live.onNewMessage(0, chat[0], chat);
+        await waitFor(() => instructions.length === 1, 2000);
+        live.onNewMessage(1, chat[1], chat);
+        live.onNewMessage(2, chat[2], chat);
+        await delay(800);
+        if (change === 'generation') generation++;
+        if (change === 'scope') scope = 'other-scope';
+        if (change === 'settings') stubs.settings.llmConnectionProfile = 'other-profile';
+        if (change === 'prompt mode') { promptMode = 'inject'; stubs.settings.autoColorize = true; }
+        pendingRequests[0].resolve('');
+        await waitFor(() => !stubs.liveState.isAutoColorizing());
+        await delay(1500);
+        assert.equal(instructions.length, 1, 'old work cannot adopt the current settings or generation');
+
+        chat.push({ name: 'Alice', is_user: false, extra: {}, mes: '"Fresh."' });
+        live.onNewMessage(3, chat[3], chat);
+        await waitFor(() => instructions.length === 2, 2000);
+        assert.ok(instructions[1].includes('"Fresh."'));
+        pendingRequests[1].resolve('');
+        await waitFor(() => !stubs.liveState.isAutoColorizing());
+    });
+}

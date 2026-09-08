@@ -154,3 +154,21 @@ test('completion is idempotent: its own output has no gaps left', () => {
         assert.equal(second.updatedText, first.updatedText);
     });
 });
+
+test('historical mappings for untouched spans survive gap completion', () => {
+    withCleanRegistry(() => {
+        const color = bobColor();
+        state.characterColors.alice = { name: 'Alice', color: '#000000', aliases: [] };
+        const input = '<font color="#112233">"Hi."</font> Bob said "Hello."\n[COLORS:Alice=#112233]';
+        const result = fillUncoloredDialogueGaps(input, 'Bob', { autoAddMessageSpeaker: true });
+        assert.equal(result.changed, true);
+        assert.ok(result.updatedText.includes('<font color="#112233">"Hi."</font>'),
+            'the model\'s own span must survive byte for byte');
+        assert.ok(result.updatedText.includes(`<font color="${color}">"Hello."</font>`),
+            'the gap must get the attributed speaker\'s color');
+        assert.match(result.updatedText, /Alice=#112233/,
+            'the historical mapping must stay attached to its untouched span');
+        assert.match(result.updatedText, new RegExp(`Bob=${color}`),
+            'the new assignment must join the metadata instead of replacing it');
+    });
+});

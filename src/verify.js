@@ -203,6 +203,8 @@ function captureVerifierSettings(options = {}) {
         maxTokens: settings.attributionMaxTokens,
         llmAttributionCheck: settings.llmAttributionCheck,
         llmAttributionParallel: settings.llmAttributionParallel,
+        passes: getAttributionVerifyPasses(),
+        thoughtSymbols: settings.thoughtSymbols,
         automatic,
         includeLoaded: options.includeLoaded === true,
         transient: options.transientOverrides === true,
@@ -217,7 +219,9 @@ function areVerifierSettingsCurrent(snapshot) {
         || settings.attributionConnectionProfile !== snapshot.connectionProfile
         || settings.attributionConservativeOnly !== snapshot.conservativeOnly
         || settings.attributionReviewPolicy !== snapshot.reviewPolicy
-        || settings.attributionMaxTokens !== snapshot.maxTokens) return false;
+        || settings.attributionMaxTokens !== snapshot.maxTokens
+        || settings.thoughtSymbols !== snapshot.thoughtSymbols
+        || getAttributionVerifyPasses() !== snapshot.passes) return false;
     if (snapshot.automatic && (settings.llmAttributionCheck !== snapshot.llmAttributionCheck
         || settings.llmAttributionParallel !== snapshot.llmAttributionParallel
         || !isAutoAttributionVerificationEnabled())) return false;
@@ -839,9 +843,27 @@ export function isVerifierSpeakerGroundedInChat(speaker, msg, mesIndex, chat = g
     return isSpeakerNamePresentInText(name, texts);
 }
 
+function captureVerifierSpeakerResolution() {
+    const resolution = new Map();
+    for (const [key, entry] of Object.entries(characterColors)) {
+        if (!entry) continue;
+        for (const name of [key, entry.name, ...(Array.isArray(entry.aliases) ? entry.aliases : [])]) {
+            const normalized = normalizeAttributionVerifierSpeaker(name)?.toLowerCase();
+            if (!normalized) continue;
+            const resolvedKey = resolveCharacterKeyByNameOrAlias(normalized);
+            resolution.set(normalized, {
+                key: resolvedKey,
+                name: normalizeAttributionVerifierSpeaker(characterColors[resolvedKey]?.name),
+            });
+        }
+    }
+    return resolution;
+}
+
 function captureAttributionVerificationTarget(identity, segments) {
     return {
         ...identity,
+        aliasResolution: captureVerifierSpeakerResolution(),
         segments: new Map(segments.map(segment => [segment.index, {
             index: segment.index,
             start: segment.start,
@@ -865,6 +887,9 @@ function isAttributionVerificationTargetCurrent(target, { allowAppendedText = fa
 
 function hasCurrentVerifierSegments(target, segments) {
     const current = new Map(segments.map(segment => [segment.index, segment]));
+    // An added segment (for example after enabling a new thought delimiter)
+    // was never submitted, so the verifier's answer cannot cover it.
+    if (current.size !== target.segments.size) return false;
     for (const original of target.segments.values()) {
         const next = current.get(original.index);
         if (!next || next.start !== original.start || next.end !== original.end
@@ -882,6 +907,12 @@ function hasCurrentVerifierSegments(target, segments) {
 
 function isAttributionVerificationTargetAndSegmentsCurrent(target, options = {}) {
     if (!isAttributionVerificationTargetCurrent(target, options)) return false;
+    const resolution = captureVerifierSpeakerResolution();
+    if (resolution.size !== target.aliasResolution.size) return false;
+    for (const [name, original] of target.aliasResolution) {
+        const current = resolution.get(name);
+        if (!current || current.key !== original.key || current.name !== original.name) return false;
+    }
     const msg = getContext()?.chat?.[target.mesIndex];
     const attribution = attributeDialogueSegments(msg?.mes, msg?.name, {
         autoAddMessageSpeaker: false,
@@ -1064,6 +1095,16 @@ export async function verifyAttributionsWithLLM(mesIndex, options = {}) {
         ...getMessageQuoteOverrideOptions(mesIndex, msg),
         mesIndex,
     });
+    // Canonicalise using the submitted mapping, already checked in full above,
+    // including names absent from the ballots and empty responses.
+    let staleTarget = false;
+    for (const ballot of ballots) {
+        for (const correction of ballot) {
+            const correctedName = normalizeAttributionVerifierSpeaker(correction.speaker);
+            const canonicalName = target.aliasResolution.get(correctedName?.toLowerCase())?.name;
+            if (canonicalName) correction.speaker = canonicalName;
+        }
+    }
     const validCorrections = reduceAttributionVerifierBallots(ballots);
     if (!isAttributionVerificationTargetCurrent(target, { allowAppendedText: useTransientOverrides })
         || !hasCurrentVerifierSegments(target, currentAttribution.segments)) {
@@ -1078,7 +1119,6 @@ export async function verifyAttributionsWithLLM(mesIndex, options = {}) {
     let appliedCorrections = 0;
     let queuedReviews = 0;
     let createdCharacters = false;
-    let staleTarget = false;
     // The target can change under us mid-loop (chat switch, edit, swipe). Once
     // corrections have already been written to metadata, reporting `unchecked`
     // hides them from the caller's toast and leaves the message unverified, so
@@ -1091,8 +1131,13 @@ export async function verifyAttributionsWithLLM(mesIndex, options = {}) {
         createdCharacters,
         aborted: true,
     });
+    // The pre-apply check above validated the original segments. From here on
+    // the verifier deliberately writes overrides and frozen siblings, so a
+    // recomputed segment comparison would see its own corrections as external
+    // edits and abort after the first one. Identity-level currency (chat,
+    // message object, text, settings, epoch) still catches real interference.
     for (const correction of validCorrections) {
-        if (!isAttributionVerificationTargetAndSegmentsCurrent(target, { allowAppendedText: useTransientOverrides })) { staleTarget = true; break; }
+        if (!isAttributionVerificationTargetCurrent(target, { allowAppendedText: useTransientOverrides })) { staleTarget = true; break; }
         const seg = segmentByIndex.get(correction.index);
         let { assignment } = resolveVerifierSpeakerName(correction.speaker, currentLookup);
         // Under full auto-accept the user opted out of review, so an unconfigured
@@ -1123,7 +1168,7 @@ export async function verifyAttributionsWithLLM(mesIndex, options = {}) {
             || (policy === 'auto-high' && (correction.confidence < AUTO_HIGH_ATTRIBUTION_CONFIDENCE || hasHumanOverride))
         );
         if (shouldQueueReview) {
-            if (!isAttributionVerificationTargetAndSegmentsCurrent(target)) { staleTarget = true; break; }
+            if (!isAttributionVerificationTargetCurrent(target)) { staleTarget = true; break; }
             const review = upsertAttributionReview({
                 message: msg,
                 messageIndex: mesIndex,
@@ -1146,7 +1191,7 @@ export async function verifyAttributionsWithLLM(mesIndex, options = {}) {
             || (policy === 'auto-high' && correction.confidence >= AUTO_HIGH_ATTRIBUTION_CONFIDENCE)
         );
         if (!shouldApply) continue;
-        if (!isAttributionVerificationTargetAndSegmentsCurrent(target, { allowAppendedText: useTransientOverrides })) { staleTarget = true; break; }
+        if (!isAttributionVerificationTargetCurrent(target, { allowAppendedText: useTransientOverrides })) { staleTarget = true; break; }
         const didSetOverride = useTransientOverrides
             ? setStreamingAttributionOverride(mesIndex, msg, correction.index, assignment.name, { source: ATTRIBUTION_SOURCE.LLM })
             : setMessageQuoteOverride(mesIndex, msg, correction.index, assignment.name, {
@@ -1161,7 +1206,7 @@ export async function verifyAttributionsWithLLM(mesIndex, options = {}) {
     }
 
     if (createdCharacters) {
-        if (!isAttributionVerificationTargetAndSegmentsCurrent(target, { allowAppendedText: useTransientOverrides })) return abortedResult();
+        if (!isAttributionVerificationTargetCurrent(target, { allowAppendedText: useTransientOverrides })) return abortedResult();
         clearSpeakerRegexCache();
         commit();
         repaintDomAfterCharacterDataChange(0);
@@ -1177,12 +1222,12 @@ export async function verifyAttributionsWithLLM(mesIndex, options = {}) {
             : appliedCorrections > 0
                 ? ATTRIBUTION_VERIFICATION_STATUS.AUTO_APPLIED
                 : ATTRIBUTION_VERIFICATION_STATUS.CLEAN;
-        if (!isAttributionVerificationTargetAndSegmentsCurrent(target)) return abortedResult();
+        if (!isAttributionVerificationTargetCurrent(target)) return abortedResult();
         markMessageAttributionVerified(mesIndex, msg, verificationStatus);
         clearStreamingAttributionOverrides(mesIndex);
     }
     if (appliedCorrections) {
-        if (!isAttributionVerificationTargetAndSegmentsCurrent(target, { allowAppendedText: useTransientOverrides })) return abortedResult();
+        if (!isAttributionVerificationTargetCurrent(target, { allowAppendedText: useTransientOverrides })) return abortedResult();
         clearMessageDomRepairTimer(mesIndex);
         cancelMessageDomFollowupRepairs(mesIndex);
         // Prefer decorating the already-rendered DOM, but never let that
@@ -1194,7 +1239,7 @@ export async function verifyAttributionsWithLLM(mesIndex, options = {}) {
         // Fall back to a full refresh the way the review-accept path does, and
         // always schedule the follow-up repair: its 0ms first tick exists for
         // exactly the case where nothing was repainted here.
-        const isCurrent = () => isAttributionVerificationTargetAndSegmentsCurrent(target, { allowAppendedText: useTransientOverrides });
+        const isCurrent = () => isAttributionVerificationTargetCurrent(target, { allowAppendedText: useTransientOverrides });
         if (isCurrent()) {
             let repainted = await decorateMessageDomFromCurrentRender(mesIndex, msg, {
                 queueVerification: false,

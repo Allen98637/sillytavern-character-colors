@@ -20,7 +20,7 @@ function isRecord(value) {
 }
 
 function lookupName(value) {
-    return String(value ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+    return String(value ?? '').normalize('NFKC').replace(/[\u0000-\u001F\u007F]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 function cleanText(value, maximum) {
@@ -51,7 +51,7 @@ export function normalizePortablePaletteMetadata(value) {
 function extractPaletteMetadata(raw, normalizedPalettes) {
     const rawPalettes = isRecord(raw?.palettes) ? raw.palettes : {};
     const rawByName = new Map(Object.entries(rawPalettes).map(([name, value]) => [lookupName(name), value]));
-    const paletteMetadata = {};
+    const paletteMetadata = Object.create(null);
     const droppedFields = [];
 
     for (const name of Object.keys(normalizedPalettes || {})) {

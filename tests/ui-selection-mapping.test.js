@@ -11,6 +11,7 @@ const stubSources = new Map([
         export const clearStreamingAttributionOverrides = () => {};
         export const decorateMessageDomFromCurrentRender = async () => false;
         export const deleteMessageQuoteOverride = () => false;
+        export const getMessageAttributionFreezeSegments = () => ({});
         export const getMessageIndexFromElement = () => -1;
         export const getMessageQuoteOverrideEntry = () => null;
         export const getMessageQuoteOverrideOptions = () => ({});
@@ -159,7 +160,7 @@ test('excludes nested Markdown destinations from source occurrence mapping', () 
     const source = '[outer [inner]](aa) aa';
     const start = source.lastIndexOf('aa');
     assert.deepEqual(
-        mapRenderedSelectionToSourceSpan(source, 'outer inner aa', 'aa', 12),
+        mapRenderedSelectionToSourceSpan(source, 'outer [inner] aa', 'aa', 14),
         { start, end: start + 2 },
     );
 });
@@ -181,6 +182,62 @@ test('preserves duplicate, multiline, underscore, bracket, and plain-text mappin
     }
 });
 
+test('host paragraph whitespace maps selections back to their exact saved offsets', () => {
+    // Installed Showdown with simpleLineBreaks emits
+    // <p>First paragraph.</p>\n<p>Second paragraph.</p> for these plain fixtures.
+    for (const gap of ['\n\n', '\n\n\n', '\r\n\r\n', '\n \n']) {
+        const source = `First paragraph.${gap}Second paragraph.`;
+        const rendered = 'First paragraph.\nSecond paragraph.';
+        const selection = 'Second paragraph.';
+        const start = source.indexOf(selection);
+        assert.deepEqual(mapRenderedSelectionToSourceSpan(source, rendered, selection, rendered.indexOf(selection)), {
+            start, end: source.length,
+        });
+        const message = { mes: source };
+        assert.equal(replaceMessageSelectionWithFontTag(message, selection, '#123456', {
+            renderedText: rendered, renderedStartOffset: rendered.indexOf(selection),
+        }), true);
+        assert.equal(message.mes, `First paragraph.${gap}<font color="#123456">Second paragraph.</font>`);
+    }
+
+    const source = 'Same.\n\nSame.\n\nSame.';
+    const rendered = 'Same.\nSame.\nSame.';
+    assert.deepEqual(mapRenderedSelectionToSourceSpan(source, rendered, 'Same.', rendered.lastIndexOf('Same.')), {
+        start: source.lastIndexOf('Same.'), end: source.length,
+    });
+    const entitySource = '&#x1F600;\r\n\r\nAA';
+    assert.deepEqual(mapRenderedSelectionToSourceSpan(entitySource, '\u{1f600}\nAA', 'A', 4), {
+        start: entitySource.length - 1, end: entitySource.length,
+    }, 'UTF-16 offsets remain aligned after entity decoding and paragraph contraction');
+});
+
+test('paragraph contraction cannot redirect a multiline selection to a later exact occurrence', () => {
+    const source = 'a\n\nb a\nb';
+    const rendered = 'a\nb a\nb';
+    assert.equal(mapRenderedSelectionToSourceSpan(source, rendered, 'a\nb', 0), null);
+    const start = source.lastIndexOf('a\nb');
+    assert.deepEqual(mapRenderedSelectionToSourceSpan(source, rendered, 'a\nb', rendered.lastIndexOf('a\nb')), {
+        start, end: source.length,
+    });
+    assert.equal(mapRenderedSelectionToSourceSpan(source, rendered, '\nb', 1), null,
+        'a contracted separator cannot be represented by just its last source newline');
+});
+
+test('paragraph whitespace matching still refuses changed words and unsafe source selections', () => {
+    assert.equal(mapRenderedSelectionToSourceSpan('Alice.\n\nBob.', 'Bob.\nAlice.', 'Alice.', 5), null);
+    assert.equal(mapRenderedSelectionToSourceSpan('Alice Bob.\n\nEnd.', 'AliceBob.\nEnd.', 'End.', 10), null,
+        'spaces inside text are not ignored');
+    const source = '`aa`\n\n<span title="aa">aa</span>\n\n&amp; &';
+    const rendered = 'aa\naa\n& &';
+    assert.equal(mapRenderedSelectionToSourceSpan(source, rendered, 'aa', 0), null);
+    const start = source.indexOf('>aa<') + 1;
+    assert.deepEqual(mapRenderedSelectionToSourceSpan(source, rendered, 'aa', 3), { start, end: start + 2 });
+    assert.equal(mapRenderedSelectionToSourceSpan(source, rendered, '&', rendered.indexOf('&')), null);
+    assert.deepEqual(mapRenderedSelectionToSourceSpan(source, rendered, '&', rendered.lastIndexOf('&')), {
+        start: source.length - 1, end: source.length,
+    });
+});
+
 test('escapes exact source text before inserting font markup', () => {
     const selectedText = '5 < 6 & 7';
     const msg = { mes: selectedText };
@@ -197,4 +254,20 @@ test('escapes exact source text before inserting font markup', () => {
         sourceEnd: 3,
     }), false);
     assert.equal(unsafe.mes, '`aa` aa');
+});
+
+test('rewritten text with no established correspondence declines the mapping', () => {
+    // The macro renders as an extra occurrence, so rendered ordinal 0 no
+    // longer matches source ordinal 0.
+    assert.equal(mapRenderedSelectionToSourceSpan('{{char}} said Alice.', 'Alice said Alice.', 'Alice', 0), null);
+
+    const heading = '# Heading\n\n#';
+    const rendered = 'Heading\n#';
+    assert.deepEqual(mapRenderedSelectionToSourceSpan(heading, rendered, '#', rendered.lastIndexOf('#')),
+        { start: 11, end: 12 });
+
+    assert.equal(mapRenderedSelectionToSourceSpan('Alice then Bob', 'Bob then Alice', 'Alice', 9), null,
+        'equal counts cannot establish the location of rewritten text');
+    assert.equal(mapRenderedSelectionToSourceSpan('{{char}} said Alice.', 'Alice said Bob.', 'Alice', 0), null,
+        'a macro can add an occurrence while another display rewrite removes one');
 });

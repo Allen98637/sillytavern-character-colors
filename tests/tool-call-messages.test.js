@@ -258,12 +258,12 @@ test('colored ordinary messages are never touched by the repair', () => {
     assert.deepEqual(chat.map(msg => msg.mes), before);
 });
 
-test('the bogus system character is removed while real speakers survive', () => {
+test('repair preserves entries whose erroneous creation cannot be independently proven', () => {
     withCleanRegistry(() => {
         ensureCharacterEntry('Emily');
         const damaged = historicallyColorizedToolText();
-        // Register the entries the way the bug registered them: by ingesting the block, which
-        // creates them locked when autoLockDetected is on.
+        // This reproduces the old bug, but the saved entry contains no creation
+        // provenance. The repair cannot infer that history from chat absence.
         processColorBlocksInText(damaged);
         assert.ok(registry()['sillytavern system'], 'the bug must have created the system entry');
 
@@ -275,8 +275,8 @@ test('the bogus system character is removed while real speakers survive', () => 
         const report = repairColorizedToolCallMessages(chat);
 
         assert.deepEqual(report.repairedIndices, [1]);
-        assert.equal(registry()['sillytavern system'], undefined);
-        assert.ok(report.removedCharacterKeys.includes('sillytavern system'));
+        assert.ok(registry()['sillytavern system']);
+        assert.deepEqual(report.removedCharacterKeys, []);
         assert.ok(registry().emily, 'a speaker referenced elsewhere must survive');
     });
 });
@@ -329,6 +329,47 @@ test('a candidate who authors an ordinary message survives tool repair', () => {
         assert.deepEqual(report.repairedIndices, [1]);
         assert.ok(registry().alice, 'ordinary message authors are real references');
         assert.ok(!report.removedCharacterKeys.includes('alice'));
+    });
+});
+
+test('a candidate named in ordinary uncolored dialogue survives tool repair', () => {
+    withCleanRegistry(() => {
+        const { entry } = ensureCharacterEntry('Emily');
+        entry.font = 'Noto Serif';
+        entry.style = 'italic';
+        entry.keep = false;
+        const damaged = historicallyColorizedToolText('Emily');
+        const chat = [
+            { name: 'Bob', is_user: false, extra: {}, mes: 'Emily said "Hello."' },
+            toolMessage(damaged),
+        ];
+
+        const report = repairColorizedToolCallMessages(chat);
+
+        assert.deepEqual(report.repairedIndices, [1]);
+        assert.equal(chat[1].mes, TOOL_MES, 'the tool text itself must still be repaired');
+        assert.ok(registry().emily, 'a speaker named in ordinary dialogue is a real reference');
+        assert.ok(!report.removedCharacterKeys.includes('emily'));
+    });
+});
+
+test('a customised character absent from this chat survives repair of a shared table', () => {
+    withCleanRegistry(() => {
+        settings.colorStorageScope = 'character';
+        const { entry } = ensureCharacterEntry('Emily');
+        entry.font = 'Noto Serif';
+        entry.style = 'italic';
+        entry.aliases = ['Em'];
+        entry.keep = false;
+        entry.locked = false;
+        const before = structuredClone(registry());
+        const chat = [toolMessage(historicallyColorizedToolText('Emily'))];
+
+        const report = repairColorizedToolCallMessages(chat);
+
+        assert.deepEqual(report, { repairedIndices: [0], removedCharacterKeys: [] });
+        assert.equal(chat[0].mes, TOOL_MES);
+        assert.deepEqual({ ...registry() }, before, 'a shared character must survive even with no local reference');
     });
 });
 

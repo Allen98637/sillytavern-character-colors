@@ -1,16 +1,17 @@
 // dom-engine.js - extracted from index.js (mechanical split)
 import { attributeDialogueSegments } from './attribution.js';
-import { ATTRIBUTION_REVIEW_METADATA_KEY, ATTRIBUTION_REVIEW_STATUS, ATTRIBUTION_SOURCE, ATTRIBUTION_VERIFICATION_STATUS, MAX_ATTRIBUTION_OVERRIDE_SEGMENTS, MAX_ATTRIBUTION_OVERRIDE_VARIANTS, createAttributionReviewStore, createAttributionStore, createMessageFingerprint, deleteAttributionOverrideRecord, getAttributionConfidenceBand, getAttributionOverrideVariantKey, isHostSystemOrToolMessage, isLegacyAttributionOverrideEntry, normalizeAttributionConfidence, normalizeAttributionEvidence, normalizeAttributionSource, setAttributionOverrideRecord } from './attribution-store.js';
+import { ATTRIBUTION_REVIEW_METADATA_KEY, ATTRIBUTION_REVIEW_STATUS, ATTRIBUTION_SOURCE, ATTRIBUTION_VERIFICATION_STATUS, MAX_ATTRIBUTION_OVERRIDE_SEGMENTS, MAX_ATTRIBUTION_OVERRIDE_VARIANTS, createAttributionReviewStore, createAttributionStore, createMessageFingerprint, createSegmentFingerprint, deleteAttributionOverrideRecord, getAttributionConfidenceBand, getAttributionOverrideVariantKey, isAttributionReviewCurrent, isHostSystemOrToolMessage, isLegacyAttributionOverrideEntry, normalizeAttributionConfidence, normalizeAttributionEvidence, normalizeAttributionSource, setAttributionOverrideRecord } from './attribution-store.js';
 import { unregisterGradientAnimationRoot } from './animation-controller.js';
 import { buildUniqueKnownColorStatsLookup, collectFontColorsFromText, countFontColorOccurrencesFromText, resolveCharacterKeyByNameOrAlias } from './color-blocks.js';
 import { applyCustomFontsToFontTags, applyCustomFontsToMessageElements, clearCustomFontsFromFontTags, loadGoogleFont, scheduleCardStyle, scheduleCustomFontRefresh } from './fonts.js';
 import { applyGradientText, clearGradientText, getVisualRenderState } from './gradient-rendering.js';
 import { isTrackedPersonaMessage, onNewMessage, queueColorStateSave } from './live-colors.js';
 import { getNarratorVisual } from './narrator-style.js';
-import { applyThemeReadabilityAndBrightness } from './palettes.js';
+import { applyThemeReadabilityAndBrightness, getTextHighlightState } from './palettes.js';
 import { escapeHtml, eventSource, event_types, getContext, saveMetadata } from './st-api.js';
-import { ATTRIBUTION_VERIFIER_VERSION, AUTO_ATTRIBUTION_VERIFY_DELAY_MS, attributionChatGeneration, characterColors, isDomEngine, runtimeState, settings, streamingAttributionOverrides, streamingSession } from './state.js';
+import { ATTRIBUTION_VERIFIER_VERSION, AUTO_ATTRIBUTION_VERIFY_DELAY_MS, attributionChatGeneration, characterColors, isDomEngine, runtimeState, settings, stableSegmentAssignments, streamingAttributionOverrides, streamingSession } from './state.js';
 import { isPlainObject } from './storage.js';
+import { getPaintedStreamingAssignment } from './streaming-paint.js';
 import { applyTextStyle, clearTextStyle, TEXT_STYLE_MARKER_ATTRIBUTE } from './text-style-rendering.js';
 import { updateLegend } from './ui.js';
 import { captureOpenDetailsState, getGoogleFontFamily, getMessageElementByIndex, hashMessageText, normalizeSegmentText, restoreOpenDetailsState, stripColorBlocks } from './utils.js';
@@ -590,7 +591,7 @@ function cloneBoundedOverrideEntry(entry, includeVariants = true) {
             if (!entries.length) continue;
             if (key === 'segments') {
                 clone[key] = Object.fromEntries(entries.map(([segmentKey, value]) => [segmentKey,
-                    value === null ? null : String(isPlainObject(value) ? value.speaker ?? value.name ?? '' : value).slice(0, 80),
+                    value === null ? null : String(isPlainObject(value) ? value.speaker ?? value.name ?? '' : value).slice(0, 120),
                 ]));
             } else if (key === 'sources') {
                 clone[key] = Object.fromEntries(entries.map(([segmentKey, value]) => [segmentKey, normalizeAttributionSource(value)]));
@@ -599,7 +600,7 @@ function cloneBoundedOverrideEntry(entry, includeVariants = true) {
             } else if (key === 'reviewIds') {
                 clone[key] = Object.fromEntries(entries.map(([segmentKey, value]) => [segmentKey, String(value ?? '').slice(0, 96)]));
             } else clone[key] = Object.fromEntries(entries.map(([segmentKey, record]) => [segmentKey, isPlainObject(record) ? {
-                    speaker: String(record.speaker ?? record.name ?? '').slice(0, 80),
+                    speaker: String(record.speaker ?? record.name ?? '').slice(0, 120),
                     source: normalizeAttributionSource(record.source),
                     confidence: normalizeAttributionConfidence(record.confidence),
                     evidence: normalizeAttributionEvidence(record.evidence),
@@ -923,13 +924,24 @@ export function getStreamingAttributionMessageId(msg, mesIndex) {
     return String(msg?.id ?? msg?.send_date ?? mesIndex ?? '');
 }
 
+function getAttributionSegmentationKey() {
+    // Change the parser prefix whenever segment numbering rules change.
+    return JSON.stringify(['html-safe-v1', settings.thoughtSymbols ?? '']);
+}
+
 export function getStreamingAttributionOverrideEntry(mesIndex, msg, create = false) {
     const key = String(mesIndex);
     const messageId = getStreamingAttributionMessageId(msg, mesIndex);
+    const chat = getContext()?.chat;
+    const swipeId = msg?.swipe_id ?? null;
+    const text = String(msg?.mes ?? '');
+    const segmentationKey = getAttributionSegmentationKey();
     let entry = streamingAttributionOverrides.get(key);
-    if (!isPlainObject(entry) || entry.messageId !== messageId) {
+    if (!isPlainObject(entry) || entry.messageId !== messageId || entry.message !== msg
+        || entry.chat !== chat || entry.swipeId !== swipeId || entry.segmentationKey !== segmentationKey
+        || !text.startsWith(entry.text)) {
         if (!create) return null;
-        entry = { messageId, segments: {}, sources: {} };
+        entry = { messageId, message: msg, chat, swipeId, text, segmentationKey, segments: {}, sources: {} };
         streamingAttributionOverrides.set(key, entry);
     }
     if (!isPlainObject(entry.segments)) entry.segments = {};
@@ -970,6 +982,7 @@ export function setStreamingAttributionOverride(mesIndex, msg, segmentIndex, spe
     if (!entry) return false;
     entry.segments[String(segmentIndex)] = String(speakerName);
     entry.sources[String(segmentIndex)] = options.source || 'llm';
+    entry.text = String(msg?.mes ?? '');
     streamingSession.assignments.clear();
     return true;
 }
@@ -1009,13 +1022,15 @@ function getMessageAttributionIdentity(msg) {
         messageFingerprint: createMessageFingerprint({ name: getMessageSpeaker(msg), mes: text }),
         swipeId: Object.prototype.hasOwnProperty.call(msg || {}, 'swipe_id') ? String(msg.swipe_id ?? '').slice(0, 64) : null,
         textLength: text.length,
+        segmentationKey: getAttributionSegmentationKey(),
     };
 }
 
-function messageQuoteOverrideEntryMatches(entry, msg) {
+function messageQuoteOverrideEntryMatches(entry, msg, options = {}) {
     if (!isPlainObject(entry) || !msg) return false;
     const identity = getMessageAttributionIdentity(msg);
     if (entry.hash !== identity.hash) return false;
+    if (!options.ignoreSegmentation && entry.segmentationKey !== identity.segmentationKey) return false;
     if (isLegacyMessageQuoteOverrideEntry(entry, msg)) return true;
     const storedMessageId = getStableMessageId({ id: entry.messageId });
     if ((storedMessageId || identity.messageId)
@@ -1039,6 +1054,7 @@ function applyMessageAttributionIdentity(entry, msg) {
     entry.hash = identity.hash;
     entry.messageFingerprint = identity.messageFingerprint;
     entry.textLength = identity.textLength;
+    entry.segmentationKey = identity.segmentationKey;
     if (identity.swipeId === null) delete entry.swipeId;
     else entry.swipeId = identity.swipeId;
     if (identity.messageId) entry.messageId = identity.messageId;
@@ -1118,7 +1134,9 @@ export function getMessageAttributionFreezeSegments(mesIndex, msg, targetSegment
     let frozenCount = 0;
     for (const segment of attribution.segments) {
         if (segment.index === target) continue;
-        frozen[String(segment.index)] = segment.assignment?.name || segment.assignment?.key || null;
+        const painted = getPaintedStreamingAssignment(mesIndex, msg, segment);
+        const assignment = painted === undefined ? segment.assignment : painted;
+        frozen[String(segment.index)] = assignment?.name || assignment?.key || null;
         if (++frozenCount >= MAX_ATTRIBUTION_OVERRIDE_SEGMENTS) break;
     }
     return frozen;
@@ -1192,6 +1210,7 @@ export function setMessageQuoteOverride(mesIndex, msg, segmentIndex, speakerName
     const workingMap = getBoundedOverrideMapForWrite(existingMap, messageKey);
     const applied = setAttributionOverrideRecord(workingMap, review, {
         message: msg,
+        segmentationKey: identity.segmentationKey,
         speaker,
         source,
         ...(confidence === undefined ? {} : { confidence }),
@@ -1238,6 +1257,7 @@ export function deleteMessageQuoteOverride(mesIndex, msg, segmentIndex) {
     const metadata = getChatMetadataStore();
     if (metadata) metadata[OVERRIDES_METADATA_KEY] = getBoundedOverrideMapForWrite(map, key);
     streamingSession.assignments.clear();
+    if (streamingSession.mesIndex === Number(mesIndex)) stableSegmentAssignments.clear();
     saveChatMetadataIfChanged(metadataBefore);
     return true;
 }
@@ -1280,36 +1300,42 @@ export function restoreMessageQuoteOverrideEntry(mesIndex, snapshot) {
     const metadata = getChatMetadataStore();
     if (metadata) metadata[OVERRIDES_METADATA_KEY] = getBoundedOverrideMapForWrite(map, key);
     streamingSession.assignments.clear();
+    if (streamingSession.mesIndex === Number(mesIndex)) stableSegmentAssignments.clear();
     saveChatMetadataIfChanged(metadataBefore);
     return true;
 }
 
 function addReconciledOverrideEntry(next, targetKey, entry, preferActive = false) {
     const candidate = cloneBoundedOverrideEntry(entry, false);
-    if (!candidate) return;
+    if (!candidate) return true;
     const existing = next[targetKey];
     if (!existing) {
         next[targetKey] = candidate;
-        return;
+        return true;
     }
     const candidateKey = getAttributionOverrideVariantKey(candidate);
-    if (candidateKey === getAttributionOverrideVariantKey(existing)) return;
+    if (candidateKey === getAttributionOverrideVariantKey(existing)) return true;
     if (preferActive) {
         const variants = Object.fromEntries(
             boundedOwnEntries(existing.variants, MAX_ATTRIBUTION_OVERRIDE_VARIANTS).entries,
         );
+        delete variants[candidateKey];
+        if (Object.keys(variants).length >= MAX_ATTRIBUTION_OVERRIDE_VARIANTS) return false;
         delete existing.variants;
         variants[getAttributionOverrideVariantKey(existing)] = existing;
         if (hasOwnEntries(variants)) candidate.variants = Object.fromEntries(
             boundedOwnEntries(variants, MAX_ATTRIBUTION_OVERRIDE_VARIANTS).entries,
         );
         next[targetKey] = candidate;
-        return;
+        return true;
     }
     const variants = isPlainObject(existing.variants) ? existing.variants : (existing.variants = {});
+    if (Object.prototype.hasOwnProperty.call(variants, candidateKey)) return true;
     if (boundedOwnEntries(variants, MAX_ATTRIBUTION_OVERRIDE_VARIANTS).entries.length < MAX_ATTRIBUTION_OVERRIDE_VARIANTS) {
         variants[candidateKey] = candidate;
+        return true;
     }
+    return false;
 }
 
 // The host renumbers mesid values after deletion while this metadata remains
@@ -1321,15 +1347,24 @@ export function reconcileMessageQuoteOverridesAfterDeletion(chat = getContext()?
     if (!messages || !map) return false;
     const metadataBefore = snapshotChatMetadataScope();
     const source = boundedOwnEntries(map, MAX_PERSISTED_ATTRIBUTION_OVERRIDE_MESSAGES);
+    // ponytail: leave the whole store untouched when a bounded scan cannot
+    // establish all identities. Partial rebuilding would discard unseen data.
+    if (chat.length > MAX_ATTRIBUTION_RECONCILE_MESSAGES || source.truncated) return false;
     const records = [];
     for (const [originKey, bucket] of source.entries) {
         if (!isPlainObject(bucket)) continue;
         records.push({ originKey, entry: bucket });
-        for (const [, variant] of boundedOwnEntries(bucket.variants, MAX_ATTRIBUTION_OVERRIDE_VARIANTS).entries) {
-            if (records.length >= MAX_ATTRIBUTION_RECONCILE_RECORDS) break;
+        const variants = boundedOwnEntries(bucket.variants, MAX_ATTRIBUTION_OVERRIDE_VARIANTS);
+        if (variants.truncated) return false;
+        for (const [, variant] of variants.entries) {
             records.push({ originKey, entry: variant });
         }
-        if (records.length >= MAX_ATTRIBUTION_RECONCILE_RECORDS) break;
+        if (records.length > MAX_ATTRIBUTION_RECONCILE_RECORDS) return false;
+    }
+    for (const { entry } of records) {
+        for (const key of ['segments', 'sources', 'confidences', 'reviewIds', 'records']) {
+            if (boundedOwnEntries(entry?.[key], MAX_ATTRIBUTION_OVERRIDE_SEGMENTS).truncated) return false;
+        }
     }
 
     const indicesById = new Map();
@@ -1352,8 +1387,8 @@ export function reconcileMessageQuoteOverridesAfterDeletion(chat = getContext()?
     for (const { originKey, entry } of records) {
         const originIndex = Number(originKey);
         if (Number.isInteger(originIndex) && originIndex >= 0
-            && messageQuoteOverrideEntryMatches(entry, messages[originIndex])) {
-            addReconciledOverrideEntry(next, originKey, entry, true);
+            && messageQuoteOverrideEntryMatches(entry, messages[originIndex], { ignoreSegmentation: true })) {
+            if (!addReconciledOverrideEntry(next, originKey, entry, true)) return false;
             continue;
         }
         const messageId = getStableMessageId({ id: entry.messageId });
@@ -1365,32 +1400,35 @@ export function reconcileMessageQuoteOverridesAfterDeletion(chat = getContext()?
                 : (indicesByHash.get(String(entry.hash || '')) || []);
         const matches = [];
         for (const index of candidates.slice(0, MAX_ATTRIBUTION_RECONCILE_CANDIDATES + 1)) {
-            if (messageQuoteOverrideEntryMatches(entry, messages[index])) matches.push(index);
+            // Inactive parser/configuration variants move with their message
+            // too, but remain unreadable until their segmentation key matches.
+            if (messageQuoteOverrideEntryMatches(entry, messages[index], { ignoreSegmentation: true })) matches.push(index);
             if (matches.length > 1) break;
         }
         if (matches.length === 1 && candidates.length <= MAX_ATTRIBUTION_RECONCILE_CANDIDATES) {
             const targetKey = String(matches[0]);
-            addReconciledOverrideEntry(next, targetKey, entry, true);
+            if (!addReconciledOverrideEntry(next, targetKey, entry, true)) return false;
             continue;
         }
         // A body mismatch under the same message ID is another swipe, not a
         // deletion. ID-less or duplicate records are equally unsafe to guess.
         if (!messageId || candidates.length || options.deletion === false) {
-            addReconciledOverrideEntry(next, originKey, entry, false);
+            if (!addReconciledOverrideEntry(next, originKey, entry, false)) return false;
         }
     }
-
     const metadata = getChatMetadataStore();
     if (!metadata) return false;
+    if (boundedOwnEntries(next, MAX_PERSISTED_ATTRIBUTION_OVERRIDE_MESSAGES).truncated) return false;
     const nextMap = getBoundedOverrideMapForWrite(next);
     metadata[OVERRIDES_METADATA_KEY] = nextMap;
-    const changed = source.truncated || snapshotChatMetadataScope(metadata) !== metadataBefore;
+    const changed = snapshotChatMetadataScope(metadata) !== metadataBefore;
     if (!changed) {
         metadata[OVERRIDES_METADATA_KEY] = map;
         return false;
     }
     streamingSession.assignments.clear();
-    saveChatMetadataIfChanged(source.truncated ? '__raw_override_overflow__' : metadataBefore, metadata);
+    stableSegmentAssignments.clear();
+    saveChatMetadataIfChanged(metadataBefore, metadata);
     return true;
 }
 
@@ -1401,7 +1439,7 @@ const sessionVerifiedMessages = new Map();
 
 function getSessionVerificationKey(msg) {
     const identity = getMessageAttributionIdentity(msg);
-    return `${identity.hash}|${identity.messageFingerprint}|${identity.textLength}`;
+    return `${identity.hash}|${identity.messageFingerprint}|${identity.textLength}|${identity.segmentationKey}`;
 }
 
 function hasSessionAttributionVerification(mesIndex, msg) {
@@ -1472,14 +1510,18 @@ export function isMessageAttributionVerified(mesIndex, msg) {
 
 function markAttributionReviewDecisionStatus(review) {
     const chat = getContext()?.chat || [];
+    if (!isAttributionReviewCurrent(review, chat)) return false;
     const index = Number(review?.messageIndex);
     const msg = Number.isInteger(index) ? chat[index] : null;
     const expectedId = String(review?.messageId ?? '');
     const currentId = String(msg?.id ?? msg?.send_date ?? '');
     if (!msg || (expectedId && expectedId !== currentId)) return false;
+    if (review.contextFingerprint !== getReviewContextFingerprint(index)) return false;
     if (review?.messageHash && review.messageHash !== hashMessageText(msg.mes)) return false;
     const hasPendingReview = getAttributionReviewAdapter().list({ status: ATTRIBUTION_REVIEW_STATUS.PENDING })
-        .some(item => item.messageFingerprint === review.messageFingerprint);
+        .some(item => item.messageFingerprint === review.messageFingerprint
+            && item.messageId === review.messageId && item.messageIdentity === review.messageIdentity
+            && item.swipeId === review.swipeId);
     return markMessageAttributionVerified(
         index,
         msg,
@@ -1487,9 +1529,25 @@ function markAttributionReviewDecisionStatus(review) {
     );
 }
 
+function getReviewContextFingerprint(messageIndex) {
+    const context = getContext();
+    const preceding = [];
+    for (let index = messageIndex - 1; index >= 0 && preceding.length < 2; index--) {
+        const message = context?.chat?.[index];
+        if (!message || isHostSystemOrToolMessage(message)) continue;
+        preceding.push([getStableMessageId(message), createMessageFingerprint(message), message.swipe_id ?? null, message.is_user === true]);
+    }
+    return createMessageFingerprint(JSON.stringify([
+        context?.chatId ?? context?.chat_id, context?.characterId ?? context?.character_id,
+        context?.groupId ?? context?.group_id, getAttributionSegmentationKey(), preceding,
+    ]));
+}
+
 export function getAttributionReviewAdapter() {
+    const chat = getContext()?.chat;
+    const metadata = getChatMetadataStore();
     return createAttributionStore({
-        getMetadata: getChatMetadataStore,
+        getMetadata: () => getContext()?.chat === chat && getChatMetadataStore() === metadata ? metadata : null,
         getChat: () => getContext()?.chat || [],
         getOverrideMap: () => getQuoteOverridesMap(true),
         // The store notifies after mutating, so there is no "before" to pass;
@@ -1497,6 +1555,7 @@ export function getAttributionReviewAdapter() {
         // re-upsert does not queue another chat rewrite.
         saveMetadata: metadata => saveChatMetadataIfChanged(null, metadata),
         extendedOverrides: true,
+        getSegmentationKey: getAttributionSegmentationKey,
         getFreezeSegments(review, message) {
             return getMessageAttributionFreezeSegments(review?.messageIndex, message, review?.segmentIndex);
         },
@@ -1504,6 +1563,19 @@ export function getAttributionReviewAdapter() {
             const requestedSpeaker = String(operationOptions?.speaker ?? review?.proposedSpeaker ?? '').trim();
             const key = resolveCharacterKeyByNameOrAlias(requestedSpeaker);
             if (!key || !Object.prototype.hasOwnProperty.call(characterColors, key) || !characterColors[key]) return false;
+            const chat = getContext()?.chat || [];
+            const message = Number.isInteger(review?.messageIndex) ? chat[review.messageIndex] : null;
+            if (!message || message.is_user || isHostSystemOrToolMessage(message)
+                || review?.segmentIndex === undefined || review?.segmentStart === undefined || review?.segmentEnd === undefined
+                || review.contextFingerprint !== getReviewContextFingerprint(review.messageIndex)) return false;
+            const attribution = attributeDialogueSegments(message.mes, message.name, {
+                autoAddMessageSpeaker: false,
+                ...getMessageQuoteOverrideOptions(review.messageIndex, message),
+                mesIndex: review.messageIndex,
+            });
+            const segment = attribution.segments.find(segment => segment.index === review.segmentIndex);
+            if (!segment || segment.start !== review.segmentStart || segment.end !== review.segmentEnd
+                || createSegmentFingerprint(segment, createMessageFingerprint(message)) !== review.segmentFingerprint) return false;
             return String(characterColors[key].name || '').trim() || false;
         },
     });
@@ -1514,7 +1586,10 @@ export function getAttributionReviewStore() {
 }
 
 export function upsertAttributionReview(candidate, options = {}) {
-    return getAttributionReviewAdapter().upsert(candidate, options);
+    return getAttributionReviewAdapter().upsert({
+        ...candidate,
+        contextFingerprint: getReviewContextFingerprint(candidate?.messageIndex),
+    }, options);
 }
 
 export function listAttributionReviews(options = {}) {
@@ -1699,15 +1774,24 @@ export function matchSegmentsToElements(segments, elements, getTargetText, onMat
 
     if (options.allowAnchoredFallback !== true || !unmatched.length) return;
 
+    const exactClaims = claimed.slice();
+    let fallbackIndex = 0;
     for (const pending of unmatched) {
         if (!pending.target) continue;
         // Bound the search to the unclaimed run starting where this segment
         // would have sat, stopping at the next element an exact match claimed.
-        let lower = pending.after;
+        let lower = Math.max(pending.after, fallbackIndex);
         while (lower < elements.length && claimed[lower]) lower++;
+        // A claim by a LATER segment anchors the boundary: this unmatched
+        // segment may only search before that element, never beyond it.
+        let nextAnchor = -1;
+        for (let i = pending.after; i < elements.length; i++) {
+            if (exactClaims[i]) { nextAnchor = i; break; }
+        }
+        const searchEnd = nextAnchor === -1 ? elements.length : nextAnchor;
         let chosen = -1;
         let candidates = 0;
-        for (let i = lower; i < elements.length && !claimed[i]; i++) {
+        for (let i = lower; i < searchEnd; i++) {
             candidates++;
             if (chosen !== -1) continue;
             if (isApproximateSegmentTextMatch(pending.target, normalizeSegmentText(elements[i].textContent))) chosen = i;
@@ -1715,10 +1799,11 @@ export function matchSegmentsToElements(segments, elements, getTargetText, onMat
         // A single unclaimed element between two anchors can only belong to
         // this segment, so accept it even when the text was rewritten wholesale.
         if (chosen === -1 && candidates === 1 && unmatched.filter(other => other.after === pending.after).length === 1) {
-            chosen = lower < elements.length && !claimed[lower] ? lower : -1;
+            chosen = lower < searchEnd ? lower : -1;
         }
         if (chosen === -1) continue;
         claimed[chosen] = true;
+        fallbackIndex = chosen + 1;
         onMatch(pending.seg, elements[chosen]);
     }
 }
@@ -1822,7 +1907,7 @@ function isSegmentOwnedVisualCurrent(seg, el) {
     if (expectsBold !== (el.style.getPropertyValue('font-weight') === 'bold')) return false;
     if (expectsItalic !== (el.style.getPropertyValue('font-style') === 'italic')) return false;
     if ((expectsBold || expectsItalic) !== el.hasAttribute(TEXT_STYLE_MARKER_ATTRIBUTE)) return false;
-    const expectsHighlightStyle = settings.highlightMode && !hasGradient;
+    const expectsHighlightStyle = !!getTextHighlightState(visual.fallbackColor).color && !hasGradient;
     if (expectsHighlightStyle) {
         if (!isOwnedStyleCurrent(el, 'background-color', SEGMENT_HIGHLIGHT_STATE_ATTRIBUTE)) return false;
     } else if (el.hasAttribute(SEGMENT_HIGHLIGHT_STATE_ATTRIBUTE)) return false;
@@ -1963,9 +2048,9 @@ export function applySegmentDecoration(seg, el) {
         loadGoogleFont(font);
         applyOwnedStyle(el, 'font-family', family, SEGMENT_FONT_STATE_ATTRIBUTE, legacyOwned);
     } else clearOwnedStyle(el, 'font-family', SEGMENT_FONT_STATE_ATTRIBUTE, legacyOwned);
-    const highlightColor = settings.highlightMode ? `${displayVisual.fallbackColor}26` : '';
+    const highlightColor = getTextHighlightState(displayVisual.fallbackColor).color;
     const gradientResult = applyGradientText(el, entry, { highlightColor, target: 'chat' });
-    if (settings.highlightMode && !gradientResult.applied) {
+    if (highlightColor && !gradientResult.applied) {
         applyOwnedStyle(el, 'background-color', highlightColor, SEGMENT_HIGHLIGHT_STATE_ATTRIBUTE, legacyOwned);
     } else clearOwnedStyle(el, 'background-color', SEGMENT_HIGHLIGHT_STATE_ATTRIBUTE, legacyOwned);
     setAttributeIfChanged(el, 'data-dc-colored', '1');

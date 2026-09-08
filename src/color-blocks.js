@@ -8,7 +8,7 @@ import { NARRATOR_VISUAL_ID, getNarratorVisual, setTransientNarratorCount } from
 import { getThoughtDelimiterSymbols } from './prompts.js';
 import { escapeHtml, escapeRegex, getContext } from './st-api.js';
 import { characterColors, isDomEngine, settings } from './state.js';
-import { isCompositeSpeakerLabel, normalizeAliases, normalizeGoogleFontName, normalizeHexColor, parseNameWithNicknames, splitCompositeSpeakerName, toast } from './utils.js';
+import { HTML_RAW_OR_CODE_ELEMENTS, findHtmlTagRanges, isCompositeSpeakerLabel, normalizeAliases, normalizeGoogleFontName, normalizeHexColor, parseNameWithNicknames, splitCompositeSpeakerName, toast } from './utils.js';
 
 function hasOwn(value, key) {
     return Object.prototype.hasOwnProperty.call(value || {}, key);
@@ -334,10 +334,42 @@ export function buildUniqueKnownColorStatsLookup() {
 export function countFontColorOccurrencesFromText(text) {
     const counts = new Map();
     const source = String(text ?? '');
-    const regex = /<font(?=\s|\/?>)[^<>]*\bcolor\s*=\s*["']?(#[0-9a-fA-F]{6})["']?[^<>]*\/?>/gi;
-    let match;
-    while ((match = regex.exec(source)) !== null) {
-        const color = match[1].toLowerCase();
+    // Consume HTML (including quoted attributes) and Markdown in source order.
+    // Deleting examples first can join text into tags that never existed.
+    const tokens = /(^ {0,3}(`{3,}(?![^\r\n]*`)|~{3,})[^\r\n]*(?:\r?\n|$))|(`+)|<!--(?:[\s\S]*?-->|[\s\S]*$)|<\/?[A-Za-z][A-Za-z0-9:-]*(?=\s|\/?>)(?:[^"'<>]|"[^"]*"|'[^']*')*>/gm;
+    for (let token; (token = tokens.exec(source));) {
+        let slashes = 0;
+        for (let i = token.index - 1; source[i] === '\\'; i--) slashes++;
+        if (slashes % 2) continue;
+        if (token[2] || token[3]) {
+            const delimiter = token[2] || token[3];
+            const close = token[2]
+                ? new RegExp(`^ {0,3}${delimiter[0]}{${delimiter.length},}[ \\t]*\\r?$`, 'gm')
+                : new RegExp('(?<!`)' + delimiter + '(?!`)', 'g');
+            close.lastIndex = tokens.lastIndex;
+            const closing = close.exec(source);
+            if (closing) tokens.lastIndex = closing.index + closing[0].length;
+            else if (token[2]) break;
+            continue;
+        }
+        const ranges = findHtmlTagRanges(token[0]);
+        const tag = ranges[0];
+        if (tag && !tag.closing && HTML_RAW_OR_CODE_ELEMENTS.has(tag.name)) {
+            const close = new RegExp(`<\\/\\s*${tag.name}\\s*>`, 'gi');
+            close.lastIndex = tokens.lastIndex;
+            const closing = close.exec(source);
+            if (!closing) break;
+            tokens.lastIndex = closing.index + closing[0].length;
+            continue;
+        }
+        if (tag?.name !== 'font' || tag.closing) continue;
+        // Consume whole attributes so data-color and colour-like text inside
+        // another attribute cannot masquerade as the font's colour.
+        const attributes = token[0].replace(/^<\s*font\b/i, '');
+        const attribute = [...attributes.matchAll(/([^\s=<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)]
+            .find(match => match[1].toLowerCase() === 'color');
+        const color = normalizeHexColor(attribute?.[2] ?? attribute?.[3] ?? attribute?.[4], null);
+        if (!color) continue;
         counts.set(color, (counts.get(color) || 0) + 1);
     }
     return counts;
@@ -464,13 +496,7 @@ export function parseColorAssignmentsFromText(text) {
 }
 
 export function collectFontColorsFromText(text) {
-    const colors = new Set();
-    const fontTagRegex = /<font(?=\s|\/?>)[^<>]*\bcolor\s*=\s*["']?(#[0-9a-fA-F]{6})["']?[^<>]*\/?>/gi;
-    let match;
-    while ((match = fontTagRegex.exec(text || '')) !== null) {
-        colors.add(match[1].toLowerCase());
-    }
-    return colors;
+    return new Set(countFontColorOccurrencesFromText(text).keys());
 }
 
 export function parseNamedColorAssignmentsFromText(text) {
@@ -494,10 +520,8 @@ export function countNarratorFontTagsFromText(text) {
         return { present: true, count: null };
     }
     let count = 0;
-    const fontTagRegex = /<font(?=\s|\/?>)[^<>]*\bcolor\s*=\s*["']?(#[0-9a-fA-F]{6})["']?[^<>]*\/?>/gi;
-    let match;
-    while ((match = fontTagRegex.exec(text || '')) !== null) {
-        if (narratorColors.has(match[1].toLowerCase())) count++;
+    for (const [color, occurrences] of countFontColorOccurrencesFromText(text)) {
+        if (narratorColors.has(color)) count += occurrences;
     }
     return { present: true, count: count || null };
 }
@@ -651,55 +675,6 @@ export function buildNameColorLookup(extraAssignments = []) {
         registerLookupAssignment(lookup, assignment.name, assignment.color, assignment.aliases, true);
     }
     return lookup;
-}
-
-export function setColorFontMapping(colorToFont, ambiguousColors, lockedColors, color, font, options = {}) {
-    const normalizedColor = normalizeHexColor(color, null);
-    const normalizedFont = normalizeGoogleFontName(font);
-    if (!normalizedColor || !normalizedFont) return;
-    if (lockedColors.has(normalizedColor) && !options.force) return;
-    const existing = colorToFont.get(normalizedColor);
-    if (existing && existing !== normalizedFont && !options.force) {
-        ambiguousColors.add(normalizedColor);
-        return;
-    }
-    colorToFont.set(normalizedColor, normalizedFont);
-    if (options.force) {
-        ambiguousColors.delete(normalizedColor);
-        lockedColors.add(normalizedColor);
-    }
-}
-
-export function buildColorFontLookup(rawText = '') {
-    const colorToFont = new Map();
-    const ambiguousColors = new Set();
-    const lockedColors = new Set();
-    const lookup = buildNameColorLookup();
-    const parsed = parseColorAssignmentsFromText(rawText);
-
-    for (const [color, names] of Object.entries(parsed.namesByColor || {})) {
-        const normalizedColor = normalizeHexColor(color, null);
-        if (!normalizedColor) continue;
-        lockedColors.add(normalizedColor);
-        if (!names || names.size !== 1) {
-            colorToFont.delete(normalizedColor);
-            continue;
-        }
-        const [nameKey] = Array.from(names);
-        const assignment = lookup.get(nameKey);
-        if (assignment?.font) setColorFontMapping(colorToFont, ambiguousColors, lockedColors, normalizedColor, assignment.font, { force: true });
-        else colorToFont.delete(normalizedColor);
-    }
-
-    for (const entry of Object.values(characterColors)) {
-        if (!entry?.font) continue;
-        setColorFontMapping(colorToFont, ambiguousColors, lockedColors, getEntryEffectiveColor(entry), entry.font);
-    }
-
-    for (const color of ambiguousColors) {
-        if (!lockedColors.has(color)) colorToFont.delete(color);
-    }
-    return colorToFont;
 }
 
 export function buildColorRenderingLookup(rawText = '') {

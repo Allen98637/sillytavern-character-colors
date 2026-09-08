@@ -40,6 +40,8 @@ export const promptManager = null;
 let pageBackground = 'rgb(0, 0, 0)';
 globalThis.document ??= { body: {}, querySelector: () => null, querySelectorAll: () => [], getElementById: () => null };
 globalThis.getComputedStyle ??= () => ({ backgroundColor: pageBackground });
+globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: () => null, setItem() {}, removeItem() {} } });
 
 const stApiUrl = `data:text/javascript;charset=utf-8,${encodeURIComponent(stApiStub)}`;
 const hooks = registerHooks({
@@ -60,14 +62,17 @@ const {
     getContrastRatio,
     getContrastSurfaceColor,
     getTextContrastSurfaceColor,
+    getTextHighlightState,
     getEntryEffectiveColor,
     getNextColor,
     flipColorsForTheme,
     invalidateThemeCache,
     isAssignedColorConflict,
+    regenerateAllColors,
     syncAllEffectiveColors,
 } = await import('../src/palettes.js');
-const { characterColors, settings } = await import('../src/state.js');
+const stateNs = await import('../src/state.js');
+const { settings } = stateNs;
 const { BUILTIN_GRADIENT_PRESETS, colorDistanceOklab, getGradientColorStops, interpolateGradientColor } = await import('../src/gradients.js');
 const { NARRATOR_VISUAL_ID, getNarratorVisual } = await import('../src/narrator-style.js');
 const { sampleGradient } = await import('../src/perceptual-conflicts.js');
@@ -78,9 +83,9 @@ hooks.deregister();
 const DEFAULT_SETTINGS = { ...settings };
 
 function withPalette({ themeMode = 'dark', brightness = 0, colorTheme = 'pastel' }, run) {
-    const previousColors = { ...characterColors };
+    const previousColors = { ...stateNs.characterColors };
     const previousBackground = pageBackground;
-    for (const key of Object.keys(characterColors)) delete characterColors[key];
+    for (const key of Object.keys(stateNs.characterColors)) delete stateNs.characterColors[key];
     // The contrast repair samples the page, so a light theme has to be tested against a light
     // page. Leaving it dark drags every color to the same end and hides real differences.
     pageBackground = themeMode === 'light' ? 'rgb(245, 245, 245)' : 'rgb(20, 22, 26)';
@@ -89,8 +94,8 @@ function withPalette({ themeMode = 'dark', brightness = 0, colorTheme = 'pastel'
     try {
         return run();
     } finally {
-        for (const key of Object.keys(characterColors)) delete characterColors[key];
-        Object.assign(characterColors, previousColors);
+        for (const key of Object.keys(stateNs.characterColors)) delete stateNs.characterColors[key];
+        Object.assign(stateNs.characterColors, previousColors);
         Object.assign(settings, DEFAULT_SETTINGS);
         pageBackground = previousBackground;
         invalidateThemeCache();
@@ -112,7 +117,7 @@ function addCharacters(count) {
     for (let i = 0; i < count; i++) {
         const built = buildCharacterEntry(`Character ${i}`);
         assert.ok(built.entry, `character ${i} should be created`);
-        characterColors[built.key] = built.entry;
+        stateNs.characterColors[built.key] = built.entry;
         entries.push(built.entry);
     }
     return entries;
@@ -138,7 +143,7 @@ for (const variant of MATRIX) {
                 assert.ok(!seen.includes(next), `getNextColor repeated ${next} after ${seen.length} characters`);
                 seen.push(next);
                 const built = buildCharacterEntry(`Character ${i}`);
-                characterColors[built.key] = built.entry;
+                stateNs.characterColors[built.key] = built.entry;
             }
         });
     });
@@ -164,7 +169,7 @@ for (const variant of MATRIX) {
             const partners = [];
             for (let i = 0; i < 8; i++) {
                 const built = buildCharacterEntry(`Character ${i}`);
-                characterColors[built.key] = built.entry;
+                stateNs.characterColors[built.key] = built.entry;
                 const partner = getNextColor();
                 built.entry.gradient = {
                     type: 'linear',
@@ -183,7 +188,7 @@ test('getNextColor avoids a color that exists only as a gradient stop', () => {
     withPalette({ themeMode: 'dark', brightness: 0 }, () => {
         const reservedStop = getNextColor();
         const built = buildCharacterEntry('Holder');
-        characterColors[built.key] = built.entry;
+        stateNs.characterColors[built.key] = built.entry;
         built.entry.gradient = {
             type: 'linear',
             angle: 90,
@@ -355,7 +360,7 @@ test('a custom palette rotates through its slots', () => {
             assert.ok(!seen.includes(next), `custom palette repeated ${next}`);
             seen.push(next);
             const built = buildCharacterEntry(`Custom ${i}`);
-            characterColors[built.key] = built.entry;
+            stateNs.characterColors[built.key] = built.entry;
         }
     });
 });
@@ -542,7 +547,7 @@ test('narrator gradient generation uses its visual identity instead of its displ
                 stops: [{ baseColor: '#ffffff', color: '#ffffff', position: 100 }],
             },
         };
-        characterColors.narration = {
+        stateNs.characterColors.narration = {
             name: 'Narration',
             baseColor: '#f86f54',
             color: '#f86f54',
@@ -565,10 +570,10 @@ test('narrator gradient generation uses its visual identity instead of its displ
         const first = createRandomGradient(narrator, { initial: true, totalStops: 3 });
         const repeatNarrator = getNarratorVisual(settings, applyThemeReadabilityAndBrightness);
         const repeat = createRandomGradient(repeatNarrator, { initial: true, totalStops: 3 });
-        const characterGradient = createRandomGradient(characterColors.narration, { initial: true, totalStops: 3 });
+        const characterGradient = createRandomGradient(stateNs.characterColors.narration, { initial: true, totalStops: 3 });
 
         assert.equal(narrator.gradientGenerator.seed, `identity-test\u001f${NARRATOR_VISUAL_ID}`);
-        assert.equal(characterColors.narration.gradientGenerator.seed, 'identity-test\u001fnarration');
+        assert.equal(stateNs.characterColors.narration.gradientGenerator.seed, 'identity-test\u001fnarration');
         assert.deepEqual(first, repeat);
         assert.notDeepEqual(first, characterGradient);
     });
@@ -589,7 +594,7 @@ test('flipping a generated gradient clears stale generator provenance', () => {
         const originalToastr = globalThis.toastr;
         document.getElementById = id => id === 'dc-legend-float' ? { style: { display: 'none' } } : null;
         globalThis.toastr = { success() {} };
-        characterColors.alice = {
+        stateNs.characterColors.alice = {
             name: 'Alice',
             baseColor: '#ff00ff',
             color: applyThemeReadabilityAndBrightness('#ff00ff'),
@@ -602,7 +607,127 @@ test('flipping a generated gradient clears stale generator provenance', () => {
         };
         try {
             flipColorsForTheme();
-            assert.equal(characterColors.alice.gradientGenerator, null);
+            assert.equal(stateNs.characterColors.alice.gradientGenerator, null);
+        } finally {
+            document.getElementById = originalGetElementById;
+            if (originalToastr === undefined) delete globalThis.toastr;
+            else globalThis.toastr = originalToastr;
+        }
+    });
+});
+
+test('an unsafe preferred display colour settles through the manual-colour path', () => {
+    withPalette({ themeMode: 'light', brightness: 0 }, () => {
+        const built = buildCharacterEntry('Alice', { colorMode: 'effective', color: '#ffffff' });
+        assert.ok(built.entry, 'entry built');
+        assert.equal(built.remapped, true, 'an unreadable preferred colour must be reported as replaced');
+        assert.notEqual(built.entry.color, '#ffffff');
+        assert.ok(getContrastRatio(built.entry.color, getContrastSurfaceColor()) >= 4.5,
+            'the accepted display colour is readable');
+        stateNs.characterColors[built.key] = built.entry;
+        const settled = built.entry.color;
+        syncAllEffectiveColors();
+        assert.equal(stateNs.characterColors[built.key].color, settled,
+            'synchronisation must not change the settled colour again');
+    });
+});
+
+test('creating a character cannot reuse another character\'s gradient stop colour', () => {
+    withPalette({ themeMode: 'dark', brightness: 0 }, () => {
+        const holder = buildCharacterEntry('Holder', { color: '#00aa00' });
+        stateNs.characterColors[holder.key] = holder.entry;
+        holder.entry.gradient = {
+            type: 'linear',
+            primaryPosition: 0,
+            stops: [{ position: 0, baseColor: '#00aa00', color: applyThemeReadabilityAndBrightness('#00aa00') },
+                { position: 100, baseColor: '#ff80ff', color: '#ff80ff' }],
+        };
+        const second = buildCharacterEntry('Second', { color: '#ff80ff' });
+        assert.ok(second.entry, 'entry built');
+        assert.equal(second.remapped, true, 'a stop colour is reserved from assignment');
+        assert.notEqual(second.entry.color, '#ff80ff');
+    });
+});
+
+test('an unsafe highlight is omitted to preserve 4.5:1 on a middle-grey surface', () => {
+    const previousBackground = pageBackground;
+    pageBackground = '#777777';
+    Object.assign(settings, DEFAULT_SETTINGS, { themeMode: 'auto', highlightMode: true });
+    invalidateThemeCache();
+    try {
+        for (const color of ['#888888', '#fefefe', '#ff0000', '#0000ff', '#00ff00']) {
+            const result = applyThemeReadabilityAndBrightness(color);
+            const highlight = getTextHighlightState(result);
+            assert.equal(highlight.color, '', 'do not paint a tint that defeats readability');
+            assert.equal(highlight.surface, '#777777');
+            assert.ok(getContrastRatio(result, highlight.surface) >= 4.5);
+        }
+    } finally {
+        pageBackground = previousBackground;
+        Object.assign(settings, DEFAULT_SETTINGS);
+        invalidateThemeCache();
+    }
+});
+
+test('preferred display colours stay byte-identical after synchronisation, even without conflict avoidance', () => {
+    for (const themeMode of ['dark', 'light']) {
+        for (const brightness of [-100, 0, 100]) {
+            for (const avoidConflicts of [true, false]) {
+                withPalette({ themeMode, brightness }, () => {
+                    for (const color of ['#ffffff', '#000000', '#f4bed0', '#a123b4']) {
+                        const { key, entry } = buildCharacterEntry('Pick', { colorMode: 'effective', color, avoidConflicts });
+                        const settled = entry.color;
+                        assert.ok(getContrastRatio(settled, getContrastSurfaceColor()) >= 4.5);
+                        stateNs.characterColors[key] = entry;
+                        syncAllEffectiveColors();
+                        assert.equal(entry.color, settled, `${themeMode}/${brightness}/${avoidConflicts}/${color}`);
+                    }
+                });
+            }
+        }
+    }
+});
+
+test('highlight compositing agrees with sRGB channel blending and every grey surface stays readable', () => {
+    withPalette({ themeMode: 'dark', brightness: 0 }, () => {
+        settings.themeMode = 'auto';
+        settings.highlightMode = true;
+        for (let grey = 0; grey <= 255; grey += 17) {
+            pageBackground = `rgb(${grey}, ${grey}, ${grey})`;
+            invalidateThemeCache();
+            for (const base of ['#888888', '#fefefe', '#ff0000', '#00ff00', '#0000ff']) {
+                const color = applyThemeReadabilityAndBrightness(base);
+                const { color: highlight, surface } = getTextHighlightState(color);
+                const alpha = highlight ? 0x26 / 255 : 0;
+                const blended = '#' + [1, 3, 5].map(offset => Math.round(parseInt(color.slice(offset, offset + 2), 16) * alpha + grey * (1 - alpha)).toString(16).padStart(2, '0')).join('');
+                assert.equal(surface, blended);
+                assert.ok(getContrastRatio(color, blended) >= 4.5, `${base} on ${pageBackground}`);
+            }
+        }
+    });
+});
+
+test('regenerating name-mates keeps them distinct while locked colours stay put', () => {
+    withPalette({ themeMode: 'dark', brightness: 0 }, () => {
+        const originalGetElementById = document.getElementById;
+        const originalToastr = globalThis.toastr;
+        document.getElementById = id => id === 'dc-legend-float' ? { style: { display: 'none' } } : null;
+        globalThis.toastr = { success() {} };
+        try {
+            const rose = buildCharacterEntry('Rose');
+            const rosemary = buildCharacterEntry('Rosemary');
+            const locked = buildCharacterEntry('Alice');
+            rose.entry.locked = false;
+            rosemary.entry.locked = false;
+            locked.entry.locked = true;
+            const lockedColor = locked.entry.color;
+            stateNs.characterColors.rose = rose.entry;
+            stateNs.characterColors.rosemary = rosemary.entry;
+            stateNs.characterColors.alice = locked.entry;
+            regenerateAllColors();
+            assert.notEqual(stateNs.characterColors.rose.color, stateNs.characterColors.rosemary.color,
+                'name-mates must not regenerate onto the same colour');
+            assert.equal(stateNs.characterColors.alice.color, lockedColor, 'locked entries are never regenerated');
         } finally {
             document.getElementById = originalGetElementById;
             if (originalToastr === undefined) delete globalThis.toastr;

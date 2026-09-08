@@ -554,6 +554,23 @@ test('anchored fallback never invents an element or double-books one', () => {
     assert.equal(new Set(ambiguous.map(pair => pair[1])).size, ambiguous.length);
 });
 
+test('an unmatched segment cannot jump over a later exact-match anchor', () => {
+    // 'Missing.' sits before 'Anchor.' in source order. The fallback must not
+    // claim 'Extra.' behind the anchor 'Anchor.' claimed.
+    const pairs = matchPairs(['Missing.', 'Anchor.'], ['Anchor.', 'Extra.'], { allowAnchoredFallback: true });
+    assert.deepEqual(pairs.filter(pair => pair[0] === 1), [[1, 0]], 'the exact match stays anchored');
+    assert.equal(pairs.some(pair => pair[0] === 0), false, 'the unmatched segment stays unmatched');
+    assert.equal(pairs.some(pair => pair[1] === 1), false, 'the element behind the anchor stays unclaimed');
+});
+
+test('successive approximate matches do not become later exact-match boundaries', () => {
+    assert.deepEqual(matchPairs(['"First."', '"Second."'], ['First.', 'Second.'], { allowAnchoredFallback: true }), [[0, 0], [1, 1]]);
+    assert.deepEqual(matchPairs(['"First."', '"First."'], ['unrelated', 'First.'], { allowAnchoredFallback: true }), [[0, 1]],
+        'a later fallback cannot reuse the earlier fallback element');
+    assert.deepEqual(matchPairs(['"First."', '"Second."'], ['Second.', 'First.'], { allowAnchoredFallback: true }), [[0, 1]],
+        'fallback matches cannot reverse source order');
+});
+
 test('approximate matching requires containment and a length floor', () => {
     assert.equal(isApproximateSegmentTextMatch('"B two here"', '"B two here" & more'), true);
     assert.equal(isApproximateSegmentTextMatch('"abc"', '"abc" plus a whole lot more text here'), false);

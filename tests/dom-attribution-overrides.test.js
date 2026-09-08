@@ -53,22 +53,32 @@ const { buildDialogueRegex, DIALOGUE_SKIP_GROUP } = await import('../src/color-b
 const { attributeDialogueSegments } = await import('../src/attribution.js');
 const {
     MAX_PERSISTED_ATTRIBUTION_OVERRIDE_MESSAGES,
+    MAX_ATTRIBUTION_RECONCILE_MESSAGES,
+    MAX_ATTRIBUTION_RECONCILE_RECORDS,
     acceptAttributionReview,
     deleteMessageQuoteOverride,
     getMessageQuoteOverrideOptions,
+    getMessageQuoteOverrideEntry,
+    getMessageAttributionFreezeSegments,
+    getMessageDomReadiness,
+    getAttributionReviewAdapter,
+    isMessageAttributionVerified,
+    listAttributionReviews,
     markMessageAttributionVerified,
     matchSegmentsToElements,
     queueObservedMessageDecoration,
     reconcileMessageQuoteOverridesAfterDeletion,
+    refreshDomDialogueCounts,
     renderMessageDomFallback,
     resolveDomSegmentIndexForElement,
+    restoreMessageQuoteOverrideEntry,
     setMessageQuoteOverride,
     setStreamingAttributionOverride,
     snapshotChatMetadataScope,
     stopDomHealthCheck,
     upsertAttributionReview,
 } = await import('../src/dom-engine.js');
-const { ATTRIBUTION_SOURCE, ATTRIBUTION_VERIFICATION_STATUS } = await import('../src/attribution-store.js');
+const { ATTRIBUTION_REVIEW_STATUS, ATTRIBUTION_SOURCE, ATTRIBUTION_VERIFICATION_STATUS } = await import('../src/attribution-store.js');
 const { characterColors, runtimeState, settings } = await import('../src/state.js');
 const { normalizeSegmentText } = await import('../src/utils.js');
 hooks.deregister();
@@ -171,6 +181,20 @@ function frozenSiblings(mesIndex, message, segmentIndex) {
     return frozen;
 }
 
+test('an 81-character speaker survives override storage intact', () => {
+    const longName = 'a'.repeat(81);
+    withCharacters([longName, 'Bob'], () => {
+        const message = { id: 'm-1', name: 'Bob', mes: '"Hello."' };
+        withChat([message], metadata => {
+            assert.equal(setMessageQuoteOverride(0, message, 0, longName), true);
+            assert.equal(metadata.dialogue_colors_overrides['0'].segments['0'], longName,
+                'the full accepted name must be stored, not a truncated copy');
+            assert.equal(speakersFor(0, message)[0], longName,
+                'the stored override must resolve back to the long-named character');
+        });
+    });
+});
+
 test('segmentation matches SillyTavern rendered quotes', () => {
     const cases = [
         '"This this"\n"Reply reply"',
@@ -205,6 +229,107 @@ test('segmentation matches SillyTavern rendered quotes', () => {
                 `segmentation diverged for ${JSON.stringify(text)}`,
             );
         }
+    });
+});
+
+test('hidden HTML thoughts are excluded before segment numbering and counting', () => {
+    withCharacters(['Alice', 'Bob'], () => {
+        for (const hidden of [
+            '<span data-hint="*thought*"></span>',
+            '<span data-hint="*" data-other="`"></span>',
+            '<!-- *thought* -->',
+            '<script>"hidden"; *thought*</script>',
+            '<style data-label="*thought*">*thought*</style>',
+            '<textarea>*thought*</textarea>',
+            '<pre><code>*thought*</code></pre>',
+            '`<script>`',
+            '```html\n<script> *thought*\n```',
+            '<span data-hint="`"></span> `<script>`',
+            '<script>const template = `hidden</script> `<script>`',
+        ]) {
+            const message = { id: 'hidden-thought', name: 'Alice', mes: `${hidden}\nBob: *thought*` };
+            withChat([message], () => {
+                const segments = attributeDialogueSegments(message.mes, message.name).segments;
+                assert.equal(segments.length, 1, hidden);
+                assert.equal(segments[0].index, 0);
+                assert.equal(segments[0].text, '*thought*');
+                assert.equal(segments[0].start, message.mes.lastIndexOf('*thought*'));
+                assert.equal(segments[0].assignment?.name, 'Bob', hidden);
+                refreshDomDialogueCounts([message]);
+                assert.equal(characterColors.bob.dialogueCount, 1);
+                assert.equal(characterColors.alice.dialogueCount || 0, 0);
+                const mesText = { querySelector: () => null, querySelectorAll: selector => selector === 'em' ? [emphasis] : [] };
+                const emphasis = createFakeElement('EM', 'thought', mesText);
+                assert.equal(resolveDomSegmentIndexForElement(emphasis, 0, message), 0);
+                const readiness = getMessageDomReadiness({ querySelector: () => mesText }, message, 0);
+                assert.equal(readiness.totalSegments, 1);
+                assert.equal(readiness.matchedSegments, 1);
+                assert.equal(readiness.expectedDecorations, 1);
+                assert.equal(readiness.ready, true);
+            });
+        }
+        const visible = '<span title="*hidden*">Bob: *thought*</span> Bob: "Hello <b>there</b>."';
+        assert.deepEqual(attributeDialogueSegments(visible, 'Alice').segments.map(segment => segment.text), [
+            '*thought*', '"Hello <b>there</b>."',
+        ]);
+    });
+});
+
+test('manual and frozen overrides remain bound to their segmentation configuration through variants and deletion', () => {
+    withCharacters(['Alice', 'Bob', 'Carol'], () => {
+        const message = { id: 'configured', name: 'Bob', mes: '*Bob waits.* "Hello." "Goodbye."', swipe_id: 0 };
+        const chat = [{ id: 'before', mes: 'Earlier.' }, message];
+        withChat(chat, metadata => {
+            assert.equal(setMessageQuoteOverride(1, message, 1, 'Alice', {
+                freezeSegments: getMessageAttributionFreezeSegments(1, message, 1),
+            }), true);
+            const original = structuredClone(getMessageQuoteOverrideEntry(1, message));
+            assert.deepEqual(speakersFor(1, message), ['Bob', 'Alice', 'Bob']);
+            settings.thoughtSymbols = '';
+            assert.equal(getMessageQuoteOverrideEntry(1, message), null);
+            assert.equal(isMessageAttributionVerified(1, message), false);
+            assert.deepEqual(speakersFor(1, message), ['Bob', 'Bob']);
+            assert.equal(setMessageQuoteOverride(1, message, 1, 'Carol', {
+                freezeSegments: getMessageAttributionFreezeSegments(1, message, 1),
+            }), true);
+            assert.deepEqual(speakersFor(1, message), ['Bob', 'Carol']);
+            metadata.dialogue_colors_overrides = JSON.parse(JSON.stringify(metadata.dialogue_colors_overrides));
+            settings.thoughtSymbols = '*';
+            assert.deepEqual(speakersFor(1, message), ['Bob', 'Alice', 'Bob']);
+            restoreMessageQuoteOverrideEntry(1, original);
+            assert.deepEqual(speakersFor(1, message), ['Bob', 'Alice', 'Bob']);
+            settings.thoughtSymbols = '';
+            assert.deepEqual(speakersFor(1, message), ['Bob', 'Carol']);
+            chat.shift();
+            assert.equal(reconcileMessageQuoteOverridesAfterDeletion(chat), true);
+            assert.deepEqual(speakersFor(0, message), ['Bob', 'Carol']);
+            settings.thoughtSymbols = '*';
+            assert.deepEqual(speakersFor(0, message), ['Bob', 'Alice', 'Bob']);
+            assert.equal(Object.keys(metadata.dialogue_colors_overrides['0'].variants).length, 1);
+        });
+    });
+});
+
+test('pre-parser-key overrides cannot transfer a hidden thought correction onto visible text', () => {
+    withCharacters(['Alice', 'Bob'], () => {
+        const message = { id: 'old-parser', name: 'Alice', mes: '<span data-hint="*thought*"></span>\nBob: *thought*' };
+        withChat([message], metadata => {
+            setMessageQuoteOverride(0, message, 0, 'Alice');
+            const legacy = metadata.dialogue_colors_overrides['0'];
+            delete legacy.segmentationKey;
+            const before = JSON.stringify(metadata);
+            assert.equal(getMessageQuoteOverrideEntry(0, message), null);
+            assert.equal(isMessageAttributionVerified(0, message), false);
+            assert.deepEqual(speakersFor(0, message), ['Bob']);
+            assert.equal(JSON.stringify(metadata), before, 'reading an incompatible record does not migrate its indices');
+            delete legacy.messageId;
+            delete legacy.messageFingerprint;
+            assert.equal(getMessageQuoteOverrideEntry(0, message), null, 'hash-only migration cannot bypass parser identity');
+            setMessageQuoteOverride(0, message, 0, 'Bob');
+            assert.deepEqual(speakersFor(0, message), ['Bob']);
+            assert.equal(Object.keys(metadata.dialogue_colors_overrides['0'].variants).length, 1,
+                'an explicit new correction archives rather than retags the old record');
+        });
     });
 });
 
@@ -434,7 +559,185 @@ test('review acceptance uses the freeze-preserving persistent write', () => {
             assert.equal(entry.sources['0'], ATTRIBUTION_SOURCE.REVIEW);
             assert.equal(entry.segments['1'], 'Bob');
             assert.equal(entry.sources['1'], ATTRIBUTION_SOURCE.FROZEN);
+            settings.thoughtSymbols = '';
+            assert.equal(getMessageQuoteOverrideEntry(0, message), null, 'accepted reviews carry the same segmentation binding');
+            settings.thoughtSymbols = '*';
+            assert.equal(getMessageQuoteOverrideEntry(0, message).segments['0'], 'Alice');
         });
+    });
+});
+
+test('identical messages keep independent pending reviews', () => {
+    withCharacters(['Alice', 'Bob'], () => {
+        const messages = [
+            { id: 'm-a', name: 'Bob', mes: '"Same."' },
+            { id: 'm-b', name: 'Bob', mes: '"Same."' },
+        ];
+        withChat(messages, metadata => {
+            const reviews = messages.map((message, messageIndex) => {
+                const [segment] = attributeDialogueSegments(message.mes, message.name, { autoAddMessageSpeaker: false }).segments;
+                return upsertAttributionReview({
+                    message,
+                    messageIndex,
+                    segment,
+                    currentSpeaker: 'Bob',
+                    proposedSpeaker: 'Alice',
+                    source: ATTRIBUTION_SOURCE.LLM,
+                    confidence: 0.9,
+                });
+            });
+            assert.ok(reviews[0] && reviews[1]);
+            assert.notEqual(reviews[0].id, reviews[1].id, 'identical text in two messages must not share a review id');
+            assert.equal(listAttributionReviews({ status: ATTRIBUTION_REVIEW_STATUS.PENDING }).length, 2);
+            assert.equal(acceptAttributionReview(reviews[0].id)?.status, ATTRIBUTION_REVIEW_STATUS.ACCEPTED);
+            const remaining = listAttributionReviews({ status: ATTRIBUTION_REVIEW_STATUS.PENDING });
+            assert.equal(remaining.length, 1, 'accepting one review must leave the other pending');
+            assert.equal(remaining[0].id, reviews[1].id);
+        });
+    });
+});
+
+test('reviews for different swipes of one message stay independent', () => {
+    withCharacters(['Alice', 'Bob'], () => {
+        const message = { id: 'm-1', swipe_id: 0, name: 'Bob', mes: '"Same."' };
+        withChat([message], metadata => {
+            const [segment] = attributeDialogueSegments(message.mes, message.name, { autoAddMessageSpeaker: false }).segments;
+            const first = upsertAttributionReview({
+                message, messageIndex: 0, segment,
+                currentSpeaker: 'Bob', proposedSpeaker: 'Alice',
+                source: ATTRIBUTION_SOURCE.LLM, confidence: 0.9,
+            });
+            message.swipe_id = 1;
+            const second = upsertAttributionReview({
+                message, messageIndex: 0, segment,
+                currentSpeaker: 'Bob', proposedSpeaker: 'Alice',
+                source: ATTRIBUTION_SOURCE.LLM, confidence: 0.9,
+            });
+            assert.ok(first && second);
+            assert.notEqual(first.id, second.id, 'each swipe is its own review target');
+            assert.equal(listAttributionReviews({ status: ATTRIBUTION_REVIEW_STATUS.PENDING }).length, 2);
+        });
+    });
+});
+
+test('accepting a review after a swipe change refuses the write', () => {
+    withCharacters(['Alice', 'Bob'], () => {
+        const message = { id: 'm-1', swipe_id: 0, name: 'Bob', mes: '"Same."' };
+        withChat([message], metadata => {
+            const [segment] = attributeDialogueSegments(message.mes, message.name, { autoAddMessageSpeaker: false }).segments;
+            const review = upsertAttributionReview({
+                message, messageIndex: 0, segment,
+                currentSpeaker: 'Bob', proposedSpeaker: 'Alice',
+                source: ATTRIBUTION_SOURCE.LLM, confidence: 0.9,
+            });
+            assert.ok(review);
+            message.swipe_id = 1;
+            assert.equal(acceptAttributionReview(review.id), null);
+            assert.equal(metadata.dialogue_colors_overrides?.['0'], undefined, 'no override may be written for a different swipe');
+        });
+    });
+});
+
+test('accepting a review after thought delimiters reindex segments refuses the write', () => {
+    withCharacters(['Alice', 'Bob'], () => {
+        settings.thoughtSymbols = '';
+        const message = { id: 'm-1', name: 'Bob', mes: '*thinks* "Hi."' };
+        withChat([message], metadata => {
+            const quote = attributeDialogueSegments(message.mes, message.name, { autoAddMessageSpeaker: false })
+                .segments.find(segment => segment.delimiter !== '*' && segment.delimiter !== '_');
+            const review = upsertAttributionReview({
+                message, messageIndex: 0, segment: quote,
+                currentSpeaker: 'Bob', proposedSpeaker: 'Alice',
+                source: ATTRIBUTION_SOURCE.LLM, confidence: 0.9,
+            });
+            assert.ok(review);
+            settings.thoughtSymbols = '*';
+            assert.equal(acceptAttributionReview(review.id), null);
+            assert.equal(metadata.dialogue_colors_overrides?.['0'], undefined, 'no override may land on the reindexed thought');
+        });
+    });
+});
+
+test('review acceptance rejects changed context, missing boundaries, removed swipe and non-dialogue messages', () => {
+    const changes = [
+        (message, metadata, preceding) => { preceding.mes = 'Edited context.'; },
+        (message, metadata) => { delete metadata.dialogue_colors_attribution_reviews.pending[0].segmentStart; },
+        (message, metadata) => { delete metadata.dialogue_colors_attribution_reviews.pending[0].contextFingerprint; },
+        message => { delete message.swipe_id; },
+        message => { message.is_user = true; },
+        message => { message.extra = { tool_invocations: [] }; },
+    ];
+    withCharacters(['Alice', 'Bob'], () => {
+        for (const change of changes) {
+            const preceding = { id: 'prior', name: 'Bob', mes: 'Earlier context.' };
+            const message = { id: 'reviewed', name: 'Bob', mes: '"Same"', swipe_id: 0 };
+            withChat([preceding, message], metadata => {
+                const segment = attributeDialogueSegments(message.mes, message.name).segments[0];
+                const review = upsertAttributionReview({ message, messageIndex: 1, segment, proposedSpeaker: 'Alice' });
+                change(message, metadata, preceding);
+                assert.equal(acceptAttributionReview(review.id), null);
+                assert.equal(metadata.dialogue_colors_overrides, undefined);
+            });
+        }
+    });
+});
+
+test('ID-less reviews cannot collide with an identical replacement after deletion', () => {
+    withCharacters(['Alice', 'Bob'], () => {
+        const message = { name: 'Bob', mes: '"Same"' };
+        withChat([message], metadata => {
+            const segment = attributeDialogueSegments(message.mes, message.name).segments[0];
+            const first = upsertAttributionReview({ message, messageIndex: 0, segment, proposedSpeaker: 'Alice' });
+            assert.equal(acceptAttributionReview(first.id)?.status, 'accepted');
+            delete metadata.dialogue_colors_overrides;
+            const replacement = { ...message };
+            stApi.setTestContext({ chat: [replacement], chatMetadata: metadata });
+            acceptAttributionReview(first.id);
+            assert.equal(metadata.dialogue_colors_overrides, undefined, 'an old decision cannot mark the replacement clean');
+            const second = upsertAttributionReview({ message: replacement, messageIndex: 0, segment, proposedSpeaker: 'Alice' });
+            assert.notEqual(second.id, first.id);
+            assert.equal(second.status, 'pending');
+            assert.equal(acceptAttributionReview(second.id)?.status, 'accepted');
+        });
+    });
+});
+
+test('a retained review adapter cannot write into a replacement chat', () => {
+    withCharacters(['Alice', 'Bob'], () => {
+        const message = { id: 'reviewed', name: 'Bob', mes: '"Same"' };
+        withChat([message], metadata => {
+            const segment = attributeDialogueSegments(message.mes, message.name).segments[0];
+            const review = upsertAttributionReview({ message, messageIndex: 0, segment, proposedSpeaker: 'Alice' });
+            const adapter = getAttributionReviewAdapter();
+            const replacementMetadata = structuredClone(metadata);
+            stApi.setTestContext({ chat: [{ ...message }], chatMetadata: replacementMetadata });
+            assert.equal(adapter.accept(review.id), null);
+            assert.equal(replacementMetadata.dialogue_colors_overrides, undefined);
+        });
+    });
+});
+
+test('reconciliation leaves data byte-identical when any scan budget is exceeded', () => {
+    withChat([], metadata => {
+        const entry = { hash: 'saved', messageId: 'missing', segments: { 0: 'Alice' } };
+        const maps = [
+            { 0: { ...entry, segments: Object.fromEntries(Array.from({ length: 513 }, (_, index) => [index, 'Alice'])) } },
+            Object.fromEntries(Array.from({ length: MAX_PERSISTED_ATTRIBUTION_OVERRIDE_MESSAGES + 1 }, (_, index) => [index, { ...entry, messageId: String(index) }])),
+            { 0: { ...entry, variants: Object.fromEntries(Array.from({ length: 65 }, (_, index) => [index, { ...entry, messageId: String(index) }])) } },
+            Object.fromEntries(Array.from({ length: Math.ceil(MAX_ATTRIBUTION_RECONCILE_RECORDS / 65) }, (_, index) => [index, {
+                ...entry, variants: Object.fromEntries(Array.from({ length: 64 }, (_, variant) => [variant, { ...entry, messageId: `${index}-${variant}` }])),
+            }])),
+        ];
+        for (const map of maps) {
+            metadata.dialogue_colors_overrides = map;
+            const before = JSON.stringify(metadata);
+            assert.equal(reconcileMessageQuoteOverridesAfterDeletion([]), false);
+            assert.equal(JSON.stringify(metadata), before);
+        }
+        metadata.dialogue_colors_overrides = { 0: entry };
+        const before = JSON.stringify(metadata);
+        assert.equal(reconcileMessageQuoteOverridesAfterDeletion(new Array(MAX_ATTRIBUTION_RECONCILE_MESSAGES + 1)), false);
+        assert.equal(JSON.stringify(metadata), before);
     });
 });
 

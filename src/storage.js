@@ -37,6 +37,7 @@ const AUTO_SYNC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\
 const AUTO_SYNC_WRITER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const LOCAL_REMOTE_FONT_CONSENT_KEY = 'dc_allow_remote_fonts_local_consent_v1';
 const LOCAL_CONNECTION_PROFILES_KEY = 'dc_connection_profiles_local_v1';
+const LOCAL_ENABLED_KEY = 'dc_enabled_local_v1';
 export const LEGACY_LOCAL_STORAGE_MIGRATION_KEY = 'dc_legacy_local_storage_migrated_v1';
 const CONNECTION_PROFILE_SETTING_KEYS = Object.freeze(['llmConnectionProfile', 'attributionConnectionProfile']);
 let localRemoteFontConsent = null;
@@ -103,6 +104,35 @@ function applyLocalConnectionProfiles() {
     const local = getLocalConnectionProfiles();
     if (!local) return;
     Object.assign(settings, local);
+}
+
+let volatileLocalEnabledState = null;
+
+function getLocalEnabledState() {
+    if (typeof volatileLocalEnabledState === 'boolean') return volatileLocalEnabledState;
+    try {
+        const raw = localStorage.getItem(LOCAL_ENABLED_KEY);
+        if (raw === 'true') return true;
+        if (raw === 'false') return false;
+        return null;
+    } catch {
+        return volatileLocalEnabledState;
+    }
+}
+
+export function persistLocalEnabledState(value) {
+    const normalized = value === true;
+    try {
+        localStorage.setItem(LOCAL_ENABLED_KEY, normalized ? 'true' : 'false');
+        volatileLocalEnabledState = null;
+    } catch {
+        volatileLocalEnabledState = normalized;
+    }
+}
+
+function applyLocalEnabledState() {
+    const local = getLocalEnabledState();
+    if (local !== null) settings.enabled = local;
 }
 
 function createAutoSyncWriterId() {
@@ -760,8 +790,11 @@ export function normalizeStoredSettings(source) {
     if (source.narratorStyle !== undefined || source.disableNarration !== undefined || source.narratorColor !== undefined) {
         normalized.narratorStyle = normalizeNarratorStyle(source.narratorStyle, { legacy: source });
         if (normalized.narratorStyle.gradientGenerator) {
+            // \u001E (record) and \u001F (unit) separators are part of the seeded
+            // gradient seed grammar; stripping them breaks randomisation advance
+            // detection. Only other control characters are sanitised.
             const seed = typeof source.narratorStyle?.gradientGenerator?.seed === 'string'
-                ? source.narratorStyle.gradientGenerator.seed.replace(/[\u0000-\u001F\u007F]/g, '').slice(0, 128)
+                ? source.narratorStyle.gradientGenerator.seed.replace(/[\u0000-\u001D\u007F]/g, '').slice(0, 128)
                 : '';
             normalized.narratorStyle.gradientGenerator = seed
                 ? { ...normalized.narratorStyle.gradientGenerator, seed }
@@ -1038,6 +1071,21 @@ function clearModuleSettingsDebounce() {
 // would change nothing. Null means "unknown", which always writes.
 let lastServerVerifiedModuleRecord = null;
 
+// Set while a legacy localStorage migration has been queued for persistence but
+// not yet confirmed by the server. The completion marker is only written after a
+// verified save, so an interrupted migration is retried instead of suppressed.
+let pendingLegacyMigrationCommit = null;
+
+function commitLegacyMigrationMarkerIfPending(record) {
+    if (!pendingLegacyMigrationCommit || record?.ui?.legacyLocalStorageMigration !== pendingLegacyMigrationCommit) return;
+    try {
+        localStorage.setItem(LEGACY_LOCAL_STORAGE_MIGRATION_KEY, 'true');
+        pendingLegacyMigrationCommit = null;
+    } catch {
+        // Leave pending: a later verified save will retry the marker write.
+    }
+}
+
 function getModuleRecordSnapshot(source = getAutoSyncRecord(true)) {
     return buildAutoSyncRecord(cloneJsonValue(source));
 }
@@ -1144,6 +1192,7 @@ export function persistModuleStore(record, { debounce = true, immediate = false 
     // an immediate save costs a settings write plus a verification round-trip.
     // Any real change makes this comparison fail, so a needed write still runs.
     if (lastServerVerifiedModuleRecord !== null && recordsEqual(normalized, lastServerVerifiedModuleRecord)) {
+        commitLegacyMigrationMarkerIfPending(lastServerVerifiedModuleRecord);
         return normalized;
     }
     if (immediate) queueImmediateSettingsSave(normalized);
@@ -1156,6 +1205,9 @@ export function getAutoSyncRecord(create = false) {
     if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
         assertSupportedSchemaVersion(existing, { moduleRecord: true });
         migrateLegacyLocalConnectionProfiles(existing.globalSettings);
+        if (getLocalEnabledState() === null && hasOwn(existing.globalSettings, 'enabled')) {
+            persistLocalEnabledState(normalizeBoolean(existing.globalSettings.enabled, true));
+        }
         const normalized = buildAutoSyncRecord(existing);
         extension_settings[MODULE_NAME] = normalized;
         return normalized;
@@ -1308,6 +1360,7 @@ export function confirmAutoSyncRecord(record, { serverVerified = false } = {}) {
         updateAutoSyncUI();
         return normalized;
     }
+    commitLegacyMigrationMarkerIfPending(normalized);
     if (autoSyncPendingRecord && (!autoSyncPendingExpectedRecord
         || !recordsEqual(normalized, autoSyncPendingExpectedRecord))) {
         setAutoSyncStatusError('Remote state changed while saving');
@@ -1442,6 +1495,7 @@ export function applyAutoSyncRecord(record, {
             loadData({
                 persistPrevious: false,
                 allowLegacyFallback: !hasIncomingColorData,
+                allowRecordFallback: hasIncomingColorData,
                 persistMigrations: false,
                 allowMetadataPersistence: false,
             });
@@ -1542,6 +1596,11 @@ let activeStorageKey = null;
 let activeStorageScope = null;
 const pendingChatScopeFallbacks = new WeakMap();
 const chatScopeMetadataPersistence = new WeakMap();
+// Host branch/checkpoint/export operations copy chat metadata verbatim, so a
+// copied per-chat ID would otherwise make two chats share one color table.
+// This remembers which host chat each stored ID has been seen with.
+const observedChatScopeHostIds = new Map();
+const pendingChatScopeRotations = new WeakMap();
 const transientChatScopes = new WeakMap();
 const runtimeContextTokens = new WeakMap();
 let nextRuntimeContextToken = 1;
@@ -1655,6 +1714,105 @@ async function ensureChatScopeMetadataSafety(context = getContext()) {
     };
 }
 
+// A host branch, checkpoint, or chat export/import copies chat metadata
+// verbatim, including our per-chat ID. Sharing that ID would make two chats
+// read and write the same color table, so a stored ID seen with a new host
+// chat under the same owner gets a fresh ID. The branch starts as a copy of
+// the source table and then diverges independently. A later CHAT_RENAMED
+// event converts that provisional copy into a move of the source table.
+function rotateCopiedChatScopeId(context, metadata, storedId, { persist = true } = {}) {
+    const hostId = getHostProvidedChatId(context);
+    if (hostId === null || !metadata || typeof metadata !== 'object') return null;
+    const metadataComponent = `meta_${sanitizeStorageKeyComponent(storedId)}`;
+    const owner = getChatOwnerStorageComponent(context);
+    const fallbackComponent = `host_${sanitizeStorageKeyComponent(hostId)}`;
+    const expectedKey = `dc_chat_${owner}_${fallbackComponent}`;
+    let remembered = null;
+    try {
+        remembered = getAutoSyncRecord(true).ui?.chatScopeFallbacks?.[metadataComponent] ?? null;
+    } catch { remembered = null; }
+    const observedKey = `${owner}_${metadataComponent}`;
+    let observed = observedChatScopeHostIds.get(observedKey);
+    if (!observed) {
+        // Seed from the persisted mapping so a fresh session recognizes the
+        // owning host chat instead of reading the rotation as a second sight.
+        observed = new Set();
+        if (typeof remembered === 'string') {
+            const ownerPrefix = `dc_chat_${owner}_`;
+            if (remembered.startsWith(ownerPrefix)) {
+                const hostComponent = remembered.slice(ownerPrefix.length);
+                if (hostComponent.startsWith('host_')) observed.add(hostComponent);
+            }
+        }
+        observedChatScopeHostIds.set(observedKey, observed);
+    }
+    if (typeof remembered === 'string' && remembered.length) {
+        if (remembered === expectedKey) return null;
+        // An imported ID needs its own mapping under the new owner too, or all
+        // later branches there keep sharing it. Never copy the foreign table.
+        if (!remembered.startsWith(`dc_chat_${owner}_`)) remembered = null;
+    } else {
+        // No recorded mapping (legacy chats): only a second distinct host chat
+        // seen in this session is evidence of a copy. First sight just records.
+        if (observed.size === 0 || observed.has(fallbackComponent)) {
+            observed.add(fallbackComponent);
+            if (persist) rememberChatScopeFallback(metadataComponent, expectedKey);
+            return null;
+        }
+    }
+    if (!persist) return null;
+    const generatedId = createChatScopeId();
+    const newMetadataComponent = `meta_${sanitizeStorageKeyComponent(generatedId)}`;
+    const newHostStorageKey = `dc_chat_${owner}_${fallbackComponent}`;
+    try {
+        const record = getAutoSyncRecord(true);
+        if (isPlainObject(record.colorData)) {
+            const metaSourceKey = `dc_chat_${owner}_${metadataComponent}`;
+            // The meta-keyed table is authoritative when present (a reloaded
+            // source saves there); the remembered host key is the fallback.
+            const sourceIsActive = activeStorageScope === 'chat' && [metaSourceKey, remembered].includes(activeStorageKey);
+            const sourceKey = sourceIsActive ? activeStorageKey : isPlainObject(record.colorData[metaSourceKey])
+                ? metaSourceKey
+                : (typeof remembered === 'string' && isPlainObject(record.colorData[remembered])
+                    ? remembered
+                    : null);
+            const sourceEntry = sourceIsActive
+                ? normalizeColorDataEntry({ colors: characterColors, groupProfiles, settings })
+                : sourceKey ? record.colorData[sourceKey] : null;
+            if (isPlainObject(sourceEntry)) {
+                if (!isPlainObject(record.colorData[newHostStorageKey])) {
+                    record.colorData[newHostStorageKey] = cloneJsonValue(sourceEntry);
+                }
+                // Only seed the active host fallback. A second meta-keyed copy
+                // would take priority on reload and hide subsequent host-key edits.
+            }
+            pendingChatScopeRotations.set(metadata, {
+                sourceKey,
+                oldHostKey: remembered,
+                newHostKey: newHostStorageKey,
+                initialEntry: cloneJsonValue(record.colorData[newHostStorageKey]),
+            });
+        }
+        metadata[CHAT_SCOPE_METADATA_KEY] = generatedId;
+        pendingChatScopeFallbacks.set(metadata, fallbackComponent);
+        rememberChatScopeFallback(newMetadataComponent, newHostStorageKey);
+        persistGeneratedChatScopeId(metadata);
+    } catch (error) {
+        chatScopeMetadataPersistence.set(metadata, { status: 'failed', promise: null });
+        console.warn('[Dialogue Colors] Could not rotate a copied chat scope ID:', error);
+        return null;
+    }
+    observed.add(fallbackComponent);
+    const rotatedObservedKey = `${owner}_${newMetadataComponent}`;
+    let rotatedObserved = observedChatScopeHostIds.get(rotatedObservedKey);
+    if (!rotatedObserved) {
+        rotatedObserved = new Set();
+        observedChatScopeHostIds.set(rotatedObservedKey, rotatedObserved);
+    }
+    rotatedObserved.add(fallbackComponent);
+    return generatedId;
+}
+
 export function getCurrentChatScopeId(context = getContext(), { persist = true } = {}) {
     const metadata = context?.chatMetadata || context?.chat_metadata;
     const storedId = metadata && typeof metadata === 'object'
@@ -1663,6 +1821,12 @@ export function getCurrentChatScopeId(context = getContext(), { persist = true }
     if (storedId !== null) {
         const pendingFallback = metadata && pendingChatScopeFallbacks.get(metadata);
         if (pendingFallback) return pendingFallback;
+        const rotatedId = rotateCopiedChatScopeId(context, metadata, storedId, { persist });
+        if (rotatedId !== null) {
+            const pendingRotatedFallback = metadata && pendingChatScopeFallbacks.get(metadata);
+            if (pendingRotatedFallback) return pendingRotatedFallback;
+            return `meta_${sanitizeStorageKeyComponent(rotatedId)}`;
+        }
         return `meta_${sanitizeStorageKeyComponent(storedId)}`;
     }
 
@@ -1808,7 +1972,8 @@ function getLegacyChatStorageKeys() {
         ? getAutoSyncRecord(true).ui?.chatScopeFallbacks?.[metadataComponent]
         : null;
     return [...new Set([
-        mappedFallback,
+        typeof mappedFallback === 'string' && mappedFallback.startsWith(`dc_chat_${getChatOwnerStorageComponent()}_`)
+            ? mappedFallback : null,
         hostId !== null ? `dc_chat_${getChatOwnerStorageComponent()}_host_${sanitizeStorageKeyComponent(hostId)}` : null,
     ].filter(Boolean))];
 }
@@ -1855,7 +2020,9 @@ function findColorDataForScope(scope, primaryKey = getStorageKeyForScope(scope),
     if (primaryEntry) return { entry: primaryEntry, exists: true, sourceKey: primaryKey, legacy: false };
     if (primaryExists) return { entry: null, exists: true, sourceKey: primaryKey, legacy: false };
 
-    if (options.allowLegacyFallback === false || (scope !== 'card' && scope !== 'chat')) {
+    const allowLegacy = options.allowLegacyFallback !== false;
+    const allowRecordFallback = allowLegacy || options.allowRecordFallback === true;
+    if ((!allowLegacy && !allowRecordFallback) || (scope !== 'card' && scope !== 'chat')) {
         return { entry: null, exists: primaryExists, sourceKey: primaryKey, legacy: false };
     }
 
@@ -1868,6 +2035,10 @@ function findColorDataForScope(scope, primaryKey = getStorageKeyForScope(scope),
         const entry = normalizeColorDataEntry(store[key]);
         if (entry) return { entry, exists: true, sourceKey: key, legacy: true };
     }
+    // ponytail: allowRecordFallback resolves aliases the incoming record itself
+    // declares; device-local legacy storage is still skipped so sync cannot
+    // resurrect stale local tables the record intentionally lacks.
+    if (!allowLegacy) return { entry: null, exists: primaryExists, sourceKey: primaryKey, legacy: false };
     for (const key of candidates) {
         const legacyValue = parseStorageObject(key);
         const identityMigration = createStorageIdentityMigration();
@@ -1911,6 +2082,74 @@ function collectRenamedCharacterIds(value) {
         .filter(Boolean);
 }
 
+export function migrateRenamedChatStorage({ avatarId, groupId, oldFileName, newFileName } = {}) {
+    const oldName = typeof oldFileName === 'string' ? oldFileName.replace(/\.jsonl$/i, '').trim() : '';
+    const newName = typeof newFileName === 'string' ? newFileName.replace(/\.jsonl$/i, '').trim() : '';
+    const group = getStringOrNumberId(groupId);
+    const avatar = getStringOrNumberId(avatarId);
+    if (!oldName || !newName || oldName === newName || (group === null && avatar === null)) {
+        return Promise.resolve({ ok: true, migrated: false });
+    }
+    const character = getContext()?.characters?.find(character => character?.avatar === avatar);
+    const owner = group !== null ? `group_${sanitizeStorageKeyComponent(group)}`
+        : `card_${sanitizeStorageKeyComponent(character?.characterId ?? avatar)}`;
+    const prefix = `dc_chat_${owner}_`;
+    const oldHostKey = `${prefix}host_${sanitizeStorageKeyComponent(oldName)}`;
+    const newHostKey = `${prefix}host_${sanitizeStorageKeyComponent(newName)}`;
+
+    return runStorageOperation(async () => {
+        const context = getContext();
+        const metadata = context?.chatMetadata || context?.chat_metadata;
+        const currentChatRenamed = getChatOwnerStorageComponent(context) === owner && getHostProvidedChatId(context) === newName;
+        const activeChanged = getCurrentStorageScope() === 'chat' && currentChatRenamed;
+        const rotation = metadata && pendingChatScopeRotations.get(metadata);
+        const renamedRotation = rotation?.oldHostKey === oldHostKey && rotation.newHostKey === newHostKey ? rotation : null;
+        const record = getAutoSyncRecord(true);
+        const fallbacks = record.ui?.chatScopeFallbacks || {};
+        const oldMetaKeys = Object.keys(fallbacks).filter(id => fallbacks[id] === oldHostKey).map(id => `${prefix}${id}`);
+        const newMetaKeys = Object.keys(fallbacks).filter(id => fallbacks[id] === newHostKey).map(id => `${prefix}${id}`);
+        const sourceKeys = [...new Set([renamedRotation?.sourceKey, ...oldMetaKeys, oldHostKey].filter(Boolean))];
+        let source = sourceKeys.map(key => normalizeColorDataEntry(record.colorData[key])).find(Boolean);
+        // A host may update its filename without reloading. The still-active
+        // source then contains edits that have not reached the stored table yet.
+        if (activeChanged && sourceKeys.includes(activeStorageKey)) {
+            source = { colors: cloneJsonValue(characterColors), groupProfiles: cloneJsonValue(groupProfiles), settings: buildPortableSettingsSnapshot() };
+        } else if (activeChanged && renamedRotation && source) {
+            // CHAT_CHANGED may precede CHAT_RENAMED. Undo only the provisional
+            // copy's unchanged fields, retaining edits made since that reload.
+            source = restoreAppliedObjectChanges(source, renamedRotation.initialEntry, {
+                colors: cloneJsonValue(characterColors), groupProfiles: cloneJsonValue(groupProfiles),
+                settings: source.settings, updatedAt: source.updatedAt,
+            });
+        }
+        if (!source && !oldMetaKeys.length) return { ok: true, migrated: false };
+        if (source) {
+            record.colorData[newHostKey] = source;
+            for (const key of [...sourceKeys, ...newMetaKeys]) {
+                if (key !== newHostKey) delete record.colorData[key];
+            }
+        }
+        for (const id of Object.keys(fallbacks)) {
+            if (fallbacks[id] === oldHostKey) fallbacks[id] = newHostKey;
+        }
+        persistModuleStore(record, { debounce: false });
+        if (currentChatRenamed && metadata && typeof metadata === 'object') {
+            if (pendingChatScopeFallbacks.has(metadata)) pendingChatScopeFallbacks.set(metadata, `host_${sanitizeStorageKeyComponent(newName)}`);
+            pendingChatScopeRotations.delete(metadata);
+        }
+        if (activeChanged) {
+            activeStorageKey = null;
+            activeStorageScope = null;
+            reloadCurrentStorageWithoutPersistence();
+        }
+        const persisted = await persistSettingsImmediately(prepareExpectedModuleRecord());
+        // The host rename already succeeded. Keep the new binding on failure
+        // and retry saving it, rather than rolling back to a nonexistent file.
+        if (!persisted) queueImmediateSettingsSave();
+        return { ok: persisted, migrated: true, activeChanged, ...(!persisted ? { error: 'chat_rename_persist_failed' } : {}) };
+    });
+}
+
 export function migrateRenamedCharacterStorage(oldValue, newValue) {
     const oldIds = [...new Set(collectRenamedCharacterIds(oldValue))];
     const newIds = [...new Set(collectRenamedCharacterIds(newValue))];
@@ -1932,6 +2171,7 @@ export function migrateRenamedCharacterStorage(oldValue, newValue) {
             const sourceKey = oldCardKeys.find(key => hasOwn(record.colorData, key));
             if (sourceKey && sourceKey !== newCardKey) {
                 record.colorData[newCardKey] = cloneJsonValue(record.colorData[sourceKey]);
+                delete record.colorData[sourceKey];
                 migrated++;
             }
         }
@@ -1944,6 +2184,7 @@ export function migrateRenamedCharacterStorage(oldValue, newValue) {
             const destinationKey = `${newChatPrefix}${key.slice(oldPrefix.length)}`;
             if (destinationKey === key || hasOwn(record.colorData, destinationKey)) continue;
             record.colorData[destinationKey] = cloneJsonValue(value);
+            delete record.colorData[key];
             migrated++;
         }
 
@@ -1959,9 +2200,9 @@ export function migrateRenamedCharacterStorage(oldValue, newValue) {
         }
         // Pin buckets are keyed by the same card component the chat keys are built from, so a
         // rename orphans them exactly the way it orphans the tables above.
-        const pins = record.ui?.pinnedCharacters;
         let pinsChanged = false;
-        if (isPlainObject(pins)) {
+        for (const pins of [record.ui?.pinnedCharacters, record.ui?.unkeptCharacters]) {
+            if (!isPlainObject(pins)) continue;
             const newOwner = `card_${sanitizeStorageKeyComponent(newIds[0])}`;
             const oldOwner = oldIds
                 .map(id => `card_${sanitizeStorageKeyComponent(id)}`)
@@ -2101,7 +2342,14 @@ function restoreAppliedObjectChanges(base, applied, current) {
 
         if (appliedHas && currentHas && isPlainObject(appliedValue) && isPlainObject(currentValue)
             && (!baseHas || isPlainObject(baseValue))) {
-            restored[key] = restoreAppliedObjectChanges(baseValue, appliedValue, currentValue);
+            if (baseHas || Object.values(appliedValue).every(isPlainObject)) {
+                restored[key] = restoreAppliedObjectChanges(baseValue, appliedValue, currentValue);
+            } else if (!jsonValuesEqual(appliedValue, currentValue)) {
+                // Introduced by the failed operation and edited since: stripping
+                // unchanged fields here would leave a partial, invalid entry.
+                // Dictionaries of entries recurse above so untouched siblings go away.
+                restored[key] = cloneJsonValue(currentValue);
+            }
         }
     }
     return restored;
@@ -2390,10 +2638,12 @@ export function pinCurrentPersonaColor() {
     const entry = characterColors[findRegistryKeyByIdentity(personaIdentity)];
     const pinned = buildPinnedPersonaColor(entry);
     if (!pinned) return false;
+    const persona = normalizeRegistryIdentityName(getPersonaName());
+    const withPersona = persona ? { ...pinned, persona } : { ...pinned };
     const store = getPinnedPersonaColors();
     const resolved = resolvePinnedPersonaColor(store);
-    if (!resolved.key || jsonValuesEqual(resolved.pinned, pinned)) return resolved.migrated;
-    store[resolved.key] = pinned;
+    if (!resolved.key || jsonValuesEqual(resolved.pinned, withPersona)) return resolved.migrated;
+    store[resolved.key] = withPersona;
     return true;
 }
 
@@ -2427,12 +2677,20 @@ function getChatUserPersonaIdentities() {
 function collectPresentPinnedPersonas(store, activeIdentity) {
     const candidates = [];
     for (const [pinKey, stored] of Object.entries(store)) {
-        const identity = normalizeRegistryIdentity(String(stored?.name ?? ''));
-        if (identity && identity !== activeIdentity) candidates.push({ pinKey, identity, stored });
+        // The pin remembers the persona's own identity separately from the row name it was
+        // tracked under, so an alias row (Mari = Marisol) is still matched when the chat
+        // shows the user speaking as the persona. Pins from older versions lack the field
+        // and fall back to the row name.
+        const identity = normalizeRegistryIdentity(String(stored?.persona || stored?.name || ''));
+        const rowIdentity = normalizeRegistryIdentity(String(stored?.name || ''));
+        if (identity && identity !== activeIdentity && rowIdentity !== activeIdentity) {
+            candidates.push({ pinKey, identity, rowIdentity, stored });
+        }
     }
     if (!candidates.length) return candidates;
     const chatIdentities = getChatUserPersonaIdentities();
-    return candidates.filter(candidate => chatIdentities.has(candidate.identity));
+    return candidates.filter(candidate =>
+        chatIdentities.has(candidate.identity) || chatIdentities.has(candidate.rowIdentity));
 }
 
 // Writes every persona present in this chat back to its pin, so a color edited while some
@@ -2445,7 +2703,10 @@ export function syncPinnedPersonaColors() {
     for (const { pinKey, identity, stored } of collectPresentPinnedPersonas(store, activeIdentity)) {
         const pinned = buildPinnedPersonaColor(characterColors[findRegistryKeyByIdentity(identity)]);
         if (!pinned || jsonValuesEqual(buildPinnedPersonaColor(stored), pinned)) continue;
-        store[pinKey] = pinned;
+        store[pinKey] = {
+            ...pinned,
+            persona: stored.persona || normalizeRegistryIdentityName(String(stored.name)),
+        };
         changed = true;
     }
     return changed;
@@ -2457,7 +2718,7 @@ export function renamePinnedPersonaColor(oldName, newName) {
     const next = getPersonaPinKeys(newName);
     const nextName = normalizeRegistryIdentityName(String(newName ?? ''));
     if (!previous.pinned || !next.key || !nextName) return false;
-    store[next.key] = { ...previous.pinned, name: nextName };
+    store[next.key] = { ...previous.pinned, name: nextName, persona: nextName };
     if (previous.key !== next.key) delete store[previous.key];
     persistModuleStore(getAutoSyncRecord(true));
     return true;
@@ -2477,12 +2738,12 @@ export function restorePinnedPersonaColor() {
     // The other personas this chat was played under get their pins back too, so a chat
     // with several of the user's personas in it shows every one in its own color.
     for (const { identity, stored } of collectPresentPinnedPersonas(store, personaIdentity)) {
-        if (applyPinnedPersonaLook(stored.name, identity, buildPinnedPersonaColor(stored))) changed = true;
+        if (applyPinnedPersonaLook(stored.name, identity, buildPinnedPersonaColor(stored), stored.persona)) changed = true;
     }
     return changed;
 }
 
-function applyPinnedPersonaLook(name, identity, pinned) {
+function applyPinnedPersonaLook(name, identity, pinned, personaName = '') {
     if (!pinned) return false;
     const existingKey = findRegistryKeyByIdentity(identity);
     if (existingKey) {
@@ -2505,6 +2766,7 @@ function applyPinnedPersonaLook(name, identity, pinned) {
         font: pinned.font,
         gradient: pinned.gradient,
         gradientGenerator: pinned.gradientGenerator,
+        aliases: personaName && normalizeRegistryIdentity(name) !== identity ? [personaName] : [],
     });
     if (!built.entry) return false;
     characterColors[built.key] = built.entry;
@@ -2528,6 +2790,48 @@ export function getPinnedCharacters(owner = getChatOwnerStorageComponent()) {
 function readPinnedCharacters(owner = getChatOwnerStorageComponent()) {
     const pins = getAutoSyncRecord(true).ui?.pinnedCharacters;
     return isPlainObject(pins?.[owner]) ? pins[owner] : null;
+}
+
+// Un-Keeping deletes the shared pin, but older chat tables still carry keep=true, and the
+// next save through one of them would read that stale flag as fresh intent. The explicit
+// decision is recorded instead, so a stale table is reconciled before it can re-create the pin.
+function readUnkeptCharacterKeys(owner = getChatOwnerStorageComponent()) {
+    const map = getAutoSyncRecord(true).ui?.unkeptCharacters;
+    return isPlainObject(map?.[owner]) ? map[owner] : null;
+}
+
+function markCharacterKeyUnkept(key) {
+    if (!key) return false;
+    const record = getAutoSyncRecord(true);
+    if (!isPlainObject(record.ui)) record.ui = {};
+    if (!isPlainObject(record.ui.unkeptCharacters)) record.ui.unkeptCharacters = {};
+    const owner = getChatOwnerStorageComponent();
+    if (!isPlainObject(record.ui.unkeptCharacters[owner])) record.ui.unkeptCharacters[owner] = {};
+    if (record.ui.unkeptCharacters[owner][key] === true) return false;
+    record.ui.unkeptCharacters[owner][key] = true;
+    return true;
+}
+
+function clearCharacterKeyUnkept(key) {
+    if (!key) return false;
+    const map = readUnkeptCharacterKeys();
+    if (!map || map[key] !== true) return false;
+    delete map[key];
+    return true;
+}
+
+function reconcileUnkeptCharacters() {
+    const unkept = readUnkeptCharacterKeys();
+    if (!unkept) return false;
+    let changed = false;
+    for (const key of Object.keys(unkept)) {
+        const entry = characterColors[key];
+        if (entry && entry.keep === true) {
+            entry.keep = false;
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 // Aliases and the lock come along because they describe the character. Dialogue counts and
@@ -2560,12 +2864,14 @@ function syncPinnedCharacters() {
     let changed = false;
     for (const [key, entry] of Object.entries(characterColors)) {
         if (entry?.keep === true) {
+            clearCharacterKeyUnkept(key);
             const pinned = buildPinnedCharacter(entry);
             if (!pinned || jsonValuesEqual(store[key], pinned)) continue;
             store[key] = pinned;
             changed = true;
         } else if (hasOwn(store, key)) {
             delete store[key];
+            markCharacterKeyUnkept(key);
             changed = true;
         }
     }
@@ -2637,11 +2943,14 @@ export function captureHistoryPinState() {
     const owner = getChatOwnerStorageComponent();
     const existingCharacters = readPinnedCharacters(owner);
     const pinnedCharacters = cloneJsonValue(existingCharacters || {});
+    const unkeptCharacters = cloneJsonValue(readUnkeptCharacterKeys(owner) || {});
     for (const [key, entry] of Object.entries(characterColors)) {
         if (entry?.keep === true) {
+            delete unkeptCharacters[key];
             const pinned = buildPinnedCharacter(entry);
             if (pinned) pinnedCharacters[key] = pinned;
         } else {
+            if (hasOwn(pinnedCharacters, key)) unkeptCharacters[key] = true;
             delete pinnedCharacters[key];
         }
     }
@@ -2652,15 +2961,18 @@ export function captureHistoryPinState() {
         const activeIdentity = normalizeRegistryIdentity(getPersonaName());
         const active = resolvePinnedPersonaColor(personaColors);
         const activePin = buildPinnedPersonaColor(characterColors[findRegistryKeyByIdentity(activeIdentity)]);
-        if (active.key && activePin) personaColors[active.key] = activePin;
+        if (active.key && activePin) personaColors[active.key] = { ...activePin, persona: normalizeRegistryIdentityName(getPersonaName()) };
         for (const { pinKey, identity, stored } of collectPresentPinnedPersonas(personaColors, activeIdentity)) {
             const pinned = buildPinnedPersonaColor(characterColors[findRegistryKeyByIdentity(identity)]);
-            if (pinned && !jsonValuesEqual(buildPinnedPersonaColor(stored), pinned)) personaColors[pinKey] = pinned;
+            if (pinned && !jsonValuesEqual(buildPinnedPersonaColor(stored), pinned)) {
+                personaColors[pinKey] = { ...pinned, persona: stored.persona || stored.name };
+            }
         }
     }
     return {
         owner,
         characters: existingCharacters || Object.keys(pinnedCharacters).length ? pinnedCharacters : null,
+        unkeptCharacters,
         personas: personaColors,
     };
 }
@@ -2674,6 +2986,10 @@ export function restoreHistoryPinState(pinState) {
     else delete pinnedStores[pinState.owner];
     if (Object.keys(pinnedStores).length) record.ui.pinnedCharacters = pinnedStores;
     else delete record.ui.pinnedCharacters;
+    if (isPlainObject(pinState.unkeptCharacters)) {
+        if (!isPlainObject(record.ui.unkeptCharacters)) record.ui.unkeptCharacters = {};
+        record.ui.unkeptCharacters[pinState.owner] = cloneJsonValue(pinState.unkeptCharacters);
+    }
     record.ui.personaColors = cloneJsonValue(isPlainObject(pinState.personas) ? pinState.personas : {});
     return true;
 }
@@ -2785,12 +3101,9 @@ export function migrateLegacyLocalStorageIfNeeded() {
     }
 
     record.ui = attachStorageIdentityMigration(record.ui, identityMigration);
-    persistModuleStore(record);
-    try {
-        localStorage.setItem(LEGACY_LOCAL_STORAGE_MIGRATION_KEY, 'true');
-    } catch {
-        return { ok: false, error: 'legacy_migration_marker_failed' };
-    }
+    pendingLegacyMigrationCommit = createChatScopeId();
+    record.ui.legacyLocalStorageMigration = pendingLegacyMigrationCommit;
+    persistModuleStore(record, { immediate: true });
     return { ok: true, migrated: true };
 }
 
@@ -2806,15 +3119,22 @@ function persistActiveStorageData(options = {}) {
 export function saveData(options = {}) {
     persistLocalRemoteFontConsent(settings.allowRemoteFonts === true);
     normalizeToggleSettings();
+    persistLocalEnabledState(settings.enabled === true);
     persistLocalConnectionProfiles(settings);
     setCharacterColors(normalizeCharacterColors(characterColors));
     setGroupProfiles(normalizeGroupProfiles(groupProfiles));
     settings.colorSchemaVersion = COLOR_SCHEMA_VERSION;
     if (!options.preserveEffectiveColors) syncAllEffectiveColors();
-    syncPinnedPersonaColors();
-    syncPinnedCharacters();
     try {
         let storageKey = getStorageKey();
+        // A save can arrive after navigating but before the new table loaded. The live
+        // table and pin buckets still belong to the previous card then; syncing pins
+        // against the new context would carry that card's Kept cast into this one.
+        const tableIsCurrent = !activeStorageKey || storageKey === activeStorageKey;
+        if (tableIsCurrent) {
+            syncPinnedPersonaColors();
+            syncPinnedCharacters();
+        }
         if (activeStorageKey && storageKey !== activeStorageKey) {
             persistActiveStorageData({ debounce: false });
             console.warn('[Dialogue Colors] Ignored an unsafe direct storage scope change; use switchColorStorageScope().');
@@ -2963,6 +3283,7 @@ export function loadData(options = {}) {
     }
     applyStoredSettingsSnapshot(readStoredGlobalSettings(record), { includeColorSchemaVersion: false });
     applyLocalConnectionProfiles();
+    applyLocalEnabledState();
     settings.colorStorageScope = scope;
     normalizeToggleSettings();
     activeStorageKey = primaryKey;
@@ -2974,7 +3295,8 @@ export function loadData(options = {}) {
     const personaRestored = restorePinnedPersonaColor();
     const personaKept = markCurrentPersonaKept();
     const cardKept = markCardCharactersKept();
-    if ((migrateColorSchemaIfNeeded() || personaRestored || pinsRestored || personaKept || cardKept) && options.persistMigrations !== false) {
+    const unkeptReconciled = reconcileUnkeptCharacters();
+    if ((migrateColorSchemaIfNeeded() || personaRestored || pinsRestored || personaKept || cardKept || unkeptReconciled) && options.persistMigrations !== false) {
         saveData({ preserveEffectiveColors: true });
     }
     setColorHistory([createHistorySnapshot()]); setHistoryIndex(0);
@@ -3058,6 +3380,28 @@ async function rollbackStorageTransaction(transaction, appliedRecord, appliedRun
                 swapMode: transaction.swapMode,
             };
             const applied = appliedRuntime || currentRuntime;
+            if (applied.activeStorageKey !== baseRuntime.activeStorageKey
+                && currentRuntime.activeStorageKey === applied.activeStorageKey) {
+                // Edits made after loading the destination belong there, never
+                // in the source table that the failed switch is restoring.
+                if (!jsonValuesEqual(currentRuntime.colors, applied.colors)
+                    || !jsonValuesEqual(currentRuntime.groupProfiles, applied.groupProfiles)) {
+                    const destination = getStoredColorData(applied.activeStorageKey);
+                    setStoredColorData(
+                        applied.activeStorageKey,
+                        restoreRuntimeValue(destination?.colors || {}, applied.colors, currentRuntime.colors),
+                        destination?.settings || { ...currentRuntime.settings, colorStorageScope: applied.activeStorageScope },
+                        {
+                            debounce: false,
+                            groupProfiles: restoreRuntimeValue(destination?.groupProfiles || {}, applied.groupProfiles, currentRuntime.groupProfiles),
+                        },
+                    );
+                }
+                currentRuntime.colors = applied.colors;
+                currentRuntime.groupProfiles = applied.groupProfiles;
+                currentRuntime.history = applied.history;
+                currentRuntime.historyIndex = applied.historyIndex;
+            }
             restoreSettingsState(restoreRuntimeValue(baseRuntime.settings, applied.settings, currentRuntime.settings));
             activeStorageKey = restoreRuntimeValue(baseRuntime.activeStorageKey, applied.activeStorageKey, currentRuntime.activeStorageKey);
             activeStorageScope = restoreRuntimeValue(baseRuntime.activeStorageScope, applied.activeStorageScope, currentRuntime.activeStorageScope);
@@ -3106,6 +3450,8 @@ async function rollbackStorageTransaction(transaction, appliedRecord, appliedRun
             clearSpeakerRegexCache();
             invalidateThemeCache();
             syncAllEffectiveColors();
+            persistActiveStorageData({ debounce: false });
+            saveGlobalSettingsSnapshot({ debounce: false });
             applyLiveColorChangesFromSnapshot(
                 failedSnapshot,
                 [...new Set([...Object.keys(failedSnapshot || {}), ...Object.keys(characterColors)])],
@@ -3168,6 +3514,7 @@ async function switchColorStorageScopeInternal(
     strategy = 'switch',
     binding = captureActiveStorageBinding(),
     targetKey = getStorageKeyForScope(scope),
+    reviewedDestination = null,
 ) {
     const previousScope = binding.scope;
     const previousKey = binding.key;
@@ -3191,6 +3538,9 @@ async function switchColorStorageScopeInternal(
         }
     }
 
+    if (reviewedDestination && !importDestinationMatches(reviewedDestination)) {
+        return contextChangedError('The import destination changed after review.');
+    }
     let transaction = captureStorageTransaction(binding);
     let appliedRecord = transaction.record;
     let appliedRuntime = captureStorageRuntimeState();
@@ -3224,6 +3574,9 @@ async function switchColorStorageScopeInternal(
             };
         }
 
+        if (reviewedDestination && !importDestinationMatches(reviewedDestination)) {
+            return contextChangedError('The import destination changed while the current table was saved.');
+        }
         // Source persistence is a preflight boundary. Preserve edits made while
         // it was in flight before mutating the destination/runtime scope.
         const latestSourceColors = normalizeCharacterColors(characterColors);
@@ -3281,6 +3634,12 @@ async function switchColorStorageScopeInternal(
         const expected = prepareExpectedModuleRecord();
         appliedRecord = expected;
         appliedRuntime = captureStorageRuntimeState();
+        if (reviewedDestination) {
+            // Capture only this switch's own changes, before persistence can yield to edits.
+            reviewedDestination.runtime = true;
+            reviewedDestination.fingerprint = getImportDestinationFingerprint(scope, targetKey, { runtime: true });
+            reviewedDestination.storedFingerprint = getStoredColorDataFingerprint(targetKey);
+        }
         const persisted = await persistSettingsImmediately(expected);
         const contextCurrent = areScopeStorageKeysCurrent(scopeKeyBindings)
             && isRuntimeContextCurrent(binding.context)
@@ -3328,6 +3687,8 @@ async function switchColorStorageScopeInternal(
                 : `${descriptor.label} is active with an empty color table.`,
             refresh: { characterState: true, history: true, theme: true, ui: true, prompt: true, render: true, fonts: true },
             rollbackTransaction: transaction,
+            appliedRecord,
+            appliedRuntime,
         };
     } catch (error) {
         console.error('[Dialogue Colors] Failed to switch color storage scope:', error);
@@ -3435,6 +3796,15 @@ function getStylePackCatalogFingerprint(record) {
     }));
 }
 
+function getStylePackInstalledCatalog(record) {
+    const normalized = buildAutoSyncRecord(record || {});
+    return {
+        customPalettes: normalized.customPalettes,
+        customGradientPresets: normalized.customGradientPresets,
+        presets: normalized.presets,
+    };
+}
+
 function snapshotStylePackSelection(value) {
     if (value instanceof Set) return [...value];
     if (Array.isArray(value)) return [...value];
@@ -3495,7 +3865,7 @@ export async function analyzeStylePackImport(source) {
     const unsupported = unsupportedSchemaVersionResult(extension_settings?.[MODULE_NAME], { moduleRecord: true });
     if (unsupported) return unsupported;
     const current = buildAutoSyncRecord(extension_settings?.[MODULE_NAME] || {});
-    const conflicts = analyzeStylePackConflicts(analysis.pack, current, { includeAssignmentPresets: true });
+    const conflicts = analyzeStylePackConflicts(analysis.pack, getStylePackInstalledCatalog(current), { includeAssignmentPresets: true });
     return {
         ...analysis,
         conflicts,
@@ -3634,7 +4004,7 @@ async function applyStylePackImportInternal(normalized, digest, options, mode) {
         }
         const plan = buildStylePackInstallationPlan(
             normalized.pack,
-            record,
+            getStylePackInstalledCatalog(record),
             getStylePackPlanOptions(normalized.pack, options, installAssignments),
         );
         const assignmentsToApply = applyAssignments
@@ -3658,6 +4028,7 @@ async function applyStylePackImportInternal(normalized, digest, options, mode) {
             };
         }
 
+        if (needsScope && colorHistory[historyIndex] !== createHistorySnapshot()) saveHistory();
         mutationStarted = true;
         if (paletteOperations.length) {
             record.customPalettes = normalizeCustomPaletteRegistry({ ...record.customPalettes, ...plan.install.palettes });
@@ -3717,7 +4088,7 @@ async function applyStylePackImportInternal(normalized, digest, options, mode) {
                     [...new Set([...Object.keys(colorSnapshot), ...Object.keys(characterColors)])],
                     { saveImmediately: true },
                 );
-                commit({ history: false });
+                commit({ history: true });
             }
         }
 
@@ -3751,10 +4122,6 @@ async function applyStylePackImportInternal(normalized, digest, options, mode) {
             };
         }
 
-        if (changedRuntime) {
-            setColorHistory([createHistorySnapshot()]);
-            setHistoryIndex(0);
-        }
         return {
             ok: true,
             digest,
@@ -4250,7 +4617,9 @@ function importDestinationMatches(destination) {
         && typeof destination.fingerprint === 'string'
         && destination.fingerprint === getImportDestinationFingerprint(destination.scope, destination.key, {
             runtime: destination.runtime === true,
-        });
+        })
+        && (!hasOwn(destination, 'storedFingerprint')
+            || destination.storedFingerprint === getStoredColorDataFingerprint(destination.key));
 }
 
 function attachImportReviewContext(analysis, binding = captureActiveStorageBinding()) {
@@ -4506,11 +4875,12 @@ async function applyReviewedImportInternal(
                 'switch',
                 operationBinding,
                 requestedTargetKey,
+                reviewedDestination,
             );
             if (!switchResult.ok) return switchResult;
             transaction = switchResult.rollbackTransaction || transaction;
-            appliedRecord = getModuleRecordSnapshot();
-            appliedRuntime = captureStorageRuntimeState();
+            appliedRecord = switchResult.appliedRecord;
+            appliedRuntime = switchResult.appliedRuntime;
         }
         if (!isRuntimeContextCurrent(operationBinding.context) || !areScopeStorageKeysCurrent(contextBindings)) {
             const failedSnapshot = captureEffectiveColorSnapshot(Object.keys(characterColors));
@@ -4523,7 +4893,6 @@ async function applyReviewedImportInternal(
         const activeScope = getCurrentStorageScope();
         importBinding = captureActiveStorageBinding();
         if (activeScope === 'chat') {
-            appliedRecord = mutationStarted ? getModuleRecordSnapshot() : appliedRecord;
             const metadataSafety = await ensureChatScopeMetadataSafety();
             if (!isActiveStorageBindingCurrent(importBinding) || !areScopeStorageKeysCurrent(contextBindings)) {
                 const failedSnapshot = captureEffectiveColorSnapshot(Object.keys(characterColors));
@@ -4554,12 +4923,13 @@ async function applyReviewedImportInternal(
             || !importDestinationMatches(reviewedDestination)) {
             const failedSnapshot = captureEffectiveColorSnapshot(Object.keys(characterColors));
             const rollbackPersisted = mutationStarted
-                ? await rollbackStorageTransaction(transaction, appliedRecord, appliedRuntime, failedSnapshot, false)
+                ? await rollbackStorageTransaction(transaction, appliedRecord, appliedRuntime, failedSnapshot, true)
                 : true;
             return { ...contextChangedError('The normalized import source or destination changed after review.'), rollbackPersisted };
         }
 
         const colorSnapshot = captureEffectiveColorSnapshot(Object.keys(characterColors));
+        if (kind !== 'settings' && colorHistory[historyIndex] !== createHistorySnapshot()) saveHistory();
         mutationStarted = true;
         applyImportedPalettes(normalized);
         applyImportedSettings(normalized.settings, activeScope);
@@ -4568,7 +4938,8 @@ async function applyReviewedImportInternal(
 
         const hasColors = kind !== 'settings';
         if (hasColors) {
-            const incomingColors = normalizeImportedColorsForApply(normalized.colors, normalized.settings?.colorSchemaVersion);
+            const incomingColors = normalizeImportedColorsForApply(normalized.colors,
+                normalized.settings?.colorSchemaVersion ?? normalized.version);
             setCharacterColors(mode === 'merge'
                 ? mergeCharacterRegistriesKeepingCurrent(incomingColors, characterColors)
                 : incomingColors);
@@ -4592,7 +4963,7 @@ async function applyReviewedImportInternal(
         const renderKeys = [...new Set([...Object.keys(colorSnapshot), ...Object.keys(characterColors)])];
         applyLiveColorChangesFromSnapshot(colorSnapshot, renderKeys, { saveImmediately: true });
         const gradientPresetsChanged = applyImportedGradientPresets(normalized);
-        commit({ history: false });
+        commit({ history: hasColors });
         if (gradientPresetsChanged) refreshGradientPresetControls();
         syncUIWithSettings();
 
@@ -4624,8 +4995,10 @@ async function applyReviewedImportInternal(
             };
         }
 
-        setColorHistory([createHistorySnapshot()]);
-        setHistoryIndex(0);
+        if (!hasColors) {
+            setColorHistory([createHistorySnapshot()]);
+            setHistoryIndex(0);
+        }
         if (settings.enabled !== previousEnabled) synchronizeEnabledLifecycle();
         return {
             ok: true,

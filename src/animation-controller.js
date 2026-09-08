@@ -100,7 +100,7 @@ function refreshFallbackRootVisibility() {
     }
     if (!fallbackVisibilityIterator) fallbackVisibilityIterator = roots.values();
     let inspected = 0;
-    while (inspected < AUTO_ROOT_INSPECTION_LIMIT) {
+    while (fallbackVisibilityIterator && inspected < AUTO_ROOT_INSPECTION_LIMIT) {
         const next = fallbackVisibilityIterator.next();
         if (next.done) {
             fallbackVisibilityIterator = null;

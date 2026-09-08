@@ -107,8 +107,9 @@ test('fullscreen restores pre-existing attributes, focus, body class, and inert 
         'HTMLElement',
         'showSettingsPageSection',
         'applyPanelDisclosureState',
+        'updateLegend',
         `${claim}\n${release}\nlet activeSettingsPageSlug = 'setup';\nlet fullscreenOpener = null;\nlet fullscreenModalState = null;\n${enter}\n${exit}\nreturn { enterSettingsFullscreen, exitSettingsFullscreen };`,
-    )(document, Element, () => {}, () => {});
+    )(document, Element, () => {}, () => {}, () => {});
 
     api.enterSettingsFullscreen(opener);
     assert.equal(outside.inert, true);

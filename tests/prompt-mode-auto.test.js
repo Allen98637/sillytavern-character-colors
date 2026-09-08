@@ -93,6 +93,30 @@ test('the macro is detected in every scanned prompt source', () => {
     }
 });
 
+test('a chat note overrides the global default even when the default has the macro', () => {
+    // The host uses the chat override when it exists at all, even empty, and
+    // ignores the global default. A macro sitting in that inactive default must
+    // not suppress the injected instruction.
+    reset();
+    stApi.extension_settings.note = { default: '{{dialoguecolors}}' };
+    stApi.setTestContext({ chat: [], chatMetadata: { note_prompt: 'No macro here.' } });
+    assert.equal(promptHasDialogueColorsMacro(), false);
+    assert.equal(getEffectivePromptMode(), 'inject');
+    assert.match(flushPromptInjection(), /Dialogue Colors/);
+
+    reset();
+    stApi.extension_settings.note = { default: '{{dialoguecolors}}' };
+    stApi.setTestContext({ chat: [], chatMetadata: { note_prompt: '' } });
+    assert.equal(promptHasDialogueColorsMacro(), false);
+    assert.equal(getEffectivePromptMode(), 'inject');
+
+    // Without a chat override the default is still scanned.
+    reset();
+    stApi.extension_settings.note = { default: '{{dialoguecolors}}' };
+    assert.equal(promptHasDialogueColorsMacro(), true);
+    assert.equal(getEffectivePromptMode(), 'macro');
+});
+
 test('a detected macro suppresses the automatic injection', () => {
     reset();
     const injected = flushPromptInjection();

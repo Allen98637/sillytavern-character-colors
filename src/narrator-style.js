@@ -115,7 +115,8 @@ export function getNarratorVisual(source, resolveEffectiveColor = color => color
 }
 
 export function setTransientNarratorCount(value, source = null) {
-    const count = Number(value);
+    // null is the unknown marker; Number(null) would turn it into a fake zero.
+    const count = value === null ? null : Number(value);
     transientNarratorCount = Number.isFinite(count) && count >= 0 ? Math.floor(count) : null;
     transientNarratorCountSource = source;
     return transientNarratorCount;

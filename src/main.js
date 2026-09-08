@@ -14,7 +14,7 @@ import { buildMinimalPromptInstruction, flushPromptInjection, getEffectivePrompt
 import { eventSource, event_types, getContext } from './st-api.js';
 import { attributionChatGeneration, autoSyncPendingRecord, characterColors, expandedCharacterRows, groupProfiles, isDomEngine, isStreamingGenerationActive, lastCharKey, lastProcessedMessageSignature, pendingAttributionVerifications, runtimeState, selectedCharacterKeys, setAttributionChatGeneration, setEnabledLifecycleSynchronizer, setIsStreamingGenerationActive, setLastCharKey, setLastProcessedMessageSignature, setPendingAttributionVerifications, setSwapMode, settings, swapMode } from './state.js';
 import { beginStreamingPaint, endStreamingPaint } from './streaming-paint.js';
-import { confirmAutoSyncRecord, doAutoSyncMarkersMatch, ensureRegexScript, getAutoSyncRecord, getCharKey, getStorageKey, initAutoSync, loadData, markCurrentPersonaKept, migrateLegacyLocalStorageIfNeeded, migrateRenamedCharacterStorage, saveData, stopAutoSyncPolling, syncAutoSyncPolling, tryLoadFromCard, updateAutoSyncUI } from './storage.js';
+import { confirmAutoSyncRecord, doAutoSyncMarkersMatch, ensureRegexScript, getAutoSyncRecord, getCharKey, getStorageKey, initAutoSync, loadData, markCurrentPersonaKept, migrateLegacyLocalStorageIfNeeded, migrateRenamedCharacterStorage, migrateRenamedChatStorage, persistLocalEnabledState, saveData, stopAutoSyncPolling, syncAutoSyncPolling, tryLoadFromCard, updateAutoSyncUI } from './storage.js';
 import { applyRestoredPersonaColor, applyThemeOrBrightnessChange, clearAutoColorizeIndicators, createUI, ensurePersonaCharacter, mountWandMenuItem, renamePersonaCharacter, syncUIWithSettings, updateCharList, updateLegend } from './ui.js';
 import { cancelStreamingAttributionVerification, captureLoadedAttributionMessageBaseline, clearAutoAttributionVerificationQueue, queueAutoAttributionVerificationForRenderedMessages, scheduleStreamingAttributionVerification } from './verify.js';
 
@@ -61,17 +61,9 @@ function scheduleRegexScriptInstall() {
 function startAutomaticRuntime() {
     if (!settings.enabled || automaticRuntimeActive) return false;
     if (!enabledStorageInitialized) {
-        const requestedEnabled = settings.enabled;
-        try {
-            migrateLegacyLocalStorageIfNeeded();
-            loadData();
-            settings.enabled = requestedEnabled;
-            initAutoSync();
-        } finally {
-            // The click that starts this runtime is newer than the persisted
-            // disabled snapshot loaded above.
-            settings.enabled = requestedEnabled;
-        }
+        migrateLegacyLocalStorageIfNeeded();
+        loadData();
+        initAutoSync();
         enabledStorageInitialized = true;
         syncUIWithSettings();
     } else {
@@ -114,6 +106,9 @@ function stopAutomaticRuntime() {
 }
 
 export function syncAutomaticRuntime() {
+    // Activation can load settings several times before the checkbox handler's
+    // normal save. Make the explicit choice authoritative for every such load.
+    persistLocalEnabledState(settings.enabled === true);
     if (!settings.enabled) {
         stopAutomaticRuntime();
         return false;
@@ -392,9 +387,26 @@ export function registerEventHandlers() {
             // Run post-generation verification sweep for unverified rendered messages.
             if (isDomEngine()) queueAutoAttributionVerificationForRenderedMessages({ delay: 300 });
         },
-        generationInterrupted: () => { loudGenerationActive = false; },
+        generationInterrupted: () => {
+            loudGenerationActive = false;
+            // ponytail: host suppresses GENERATION_ENDED on stop/error, so teardown must run here too.
+            if (!automaticRuntimeActive) return;
+            setIsStreamingGenerationActive(false);
+            endStreamingPaint();
+            cancelStreamingAttributionVerification();
+        },
         chatCreated: resetDialogueCountsForNewChat,
         chatChanged: handleChatChanged,
+        // Storage identity follows host renames even while colouring is disabled.
+        chatRenamed: async payload => {
+            try {
+                const result = await migrateRenamedChatStorage(payload);
+                if (!result.ok) console.warn('[Dialogue Colors] Chat storage rename migration was not persisted.', result);
+                if (result.activeChanged && settings.enabled) handleChatChanged();
+            } catch (error) {
+                console.warn('[Dialogue Colors] Chat storage rename migration failed.', error);
+            }
+        },
         characterRenamed: (oldValue, newValue) => {
             if (!settings.enabled || !automaticRuntimeActive) return;
             void migrateRenamedCharacterStorage(oldValue, newValue)
@@ -456,6 +468,7 @@ export function registerEventHandlers() {
     if (event_types.CHAT_CREATED) eventSource.on(event_types.CHAT_CREATED, runtimeState.eventHandlers.chatCreated);
     if (event_types.GROUP_CHAT_CREATED) eventSource.on(event_types.GROUP_CHAT_CREATED, runtimeState.eventHandlers.chatCreated);
     eventSource.on(event_types.CHAT_CHANGED, runtimeState.eventHandlers.chatChanged);
+    if (event_types.CHAT_RENAMED) eventSource.on(event_types.CHAT_RENAMED, runtimeState.eventHandlers.chatRenamed);
     if (event_types.CHARACTER_RENAMED) eventSource.on(event_types.CHARACTER_RENAMED, runtimeState.eventHandlers.characterRenamed);
     if (event_types.PERSONA_CHANGED) eventSource.on(event_types.PERSONA_CHANGED, runtimeState.eventHandlers.personaChanged);
     if (event_types.PERSONA_UPDATED) eventSource.on(event_types.PERSONA_UPDATED, runtimeState.eventHandlers.personaChanged);

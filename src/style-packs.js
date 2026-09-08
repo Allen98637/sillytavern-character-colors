@@ -14,7 +14,7 @@ import {
     normalizeGradientPreset,
     normalizeGradientPresetName,
 } from './gradients.js';
-import { isDangerousRegistryIdentity, isReservedCharacterIdentity, normalizeGroupName, normalizeRegistryIdentity, resolveCanonicalAliasOwners } from './group-profiles.js';
+import { isDangerousRegistryIdentity, isReservedCharacterIdentity, normalizeGroupName, normalizeRegistryIdentity, normalizeRegistryIdentityName, resolveCanonicalAliasOwners } from './group-profiles.js';
 
 export const STYLE_PACK_FORMAT = 'dialogue-colors-style-pack';
 export const STYLE_PACK_FORMAT_VERSION = 1;
@@ -137,6 +137,9 @@ function normalizeString(value, field, maximum, { required = false, multiline = 
 function normalizeDictionaryName(value, field, maximum = STYLE_PACK_LIMITS.maxNameLength) {
     const name = normalizeString(value, field, maximum, { required: true });
     if (isDangerousRegistryIdentity(name)) fail('reserved_key', `Reserved name "${name}" is not allowed.`, { field, name });
+    if (!normalizeRegistryIdentityName(name, maximum)) {
+        fail('invalid_name', `"${name}" is not a valid ${field}.`, { field, name });
+    }
     return name;
 }
 

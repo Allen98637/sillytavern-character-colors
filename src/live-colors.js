@@ -16,7 +16,10 @@ import { getStorageKey, saveData } from './storage.js';
 import { clearAutoColorizeIndicators, hideAutoColorizeIndicator, setColorizeButtonBusy, setRecolorButtonBusy, showAutoColorizeIndicator, updateCharList, updateLegend, updateStorageScopeStatus } from './ui.js';
 import { findHtmlTagRanges, getMessageElementByIndex, hashMessageText, isCompositeSpeakerLabel, isToolCallMessage, maskHtmlTagQuotes, normalizeHexColor, normalizeSegmentText, splitsHtmlTag, toast } from './utils.js';
 
-let pendingAutoColorizeRetry = false;
+// A boolean retry flag forgets intermediate replies: when several arrive while a
+// colorize call is in flight, only the newest would ever be revisited. Keep each
+// unprocessed snapshot and consume it once, even when an earlier target is stale.
+const pendingAutoColorizeRetryTargets = [];
 let chatSaveInFlight = null;
 let colorizeRunSequence = 0;
 let activeColorizeRun = null;
@@ -32,6 +35,20 @@ const COLORIZE_BATCH_MAX_ATTEMPTS = 2;
 const COLORIZE_MAX_INDIVIDUAL_LLM_FALLBACKS = 2;
 const COLORIZE_RUN_MAX_LLM_REQUESTS = 4;
 const COLORIZE_RUN_MAX_LLM_RETRIES = 1;
+
+function queuePendingAutoColorizeRetry(target) {
+    for (let i = pendingAutoColorizeRetryTargets.length - 1; i >= 0; i--) {
+        const entry = pendingAutoColorizeRetryTargets[i];
+        // At most one snapshot per message in the current chat; old scopes and
+        // generations cannot accumulate while a provider request is pending.
+        if (entry.chat !== target.chat || entry.chatGeneration !== target.chatGeneration
+            || entry.storageKey !== target.storageKey || entry.msgIndex === target.msgIndex
+            || !isColorizeMessageCurrent(entry.chat, entry)) {
+            pendingAutoColorizeRetryTargets.splice(i, 1);
+        }
+    }
+    pendingAutoColorizeRetryTargets.push(target);
+}
 
 // A user message carries the name of the persona it was sent as. Any tracked name is a
 // target, not only the active persona, so a chat played under several personas keeps
@@ -132,13 +149,14 @@ export function resumePendingChatSave(context = getContext()) {
     const binding = captureChatBinding(context);
     if (!binding) return false;
     const record = [...chatSaveRecords].find(candidate => candidate.dirty
-        && areChatBindingsEqual(candidate.binding, binding));
+        && areChatBindingsEqual(candidate.binding, binding)
+        && candidate.revision === JSON.stringify(binding.chat));
     if (!record) {
         syncPendingChatSaveState();
         return false;
     }
-    // A host may replace the chat array when reactivating the same durable
-    // chat. Rebind only after its stable identity matches the current context.
+    // ponytail: only identical queued content can be rebound. Conflicting reloads
+    // stay pending; merging them needs an independently captured pre-edit baseline.
     record.binding = binding;
     const dueAt = Math.max(record.nextAttemptAt || 0, record.uncertainUntil || 0);
     if (Number.isFinite(dueAt)) scheduleChatSave(record, Math.max(0, dueAt - Date.now()));
@@ -178,6 +196,7 @@ function captureColorizeRunCurrency(automatic = false) {
         colorStorageScope: settings.colorStorageScope,
         autoColorize: automatic ? settings.autoColorize === true : null,
         autoScanNewMessages: automatic ? settings.autoScanNewMessages !== false : null,
+        promptMode: automatic ? getEffectivePromptMode() : null,
         narratorVisualColor: narrator?.color ?? null,
         registryFingerprint: getPersistentRegistryFingerprint(),
     });
@@ -208,7 +227,11 @@ function recordColorizeRequestFailure(budget, errorOrClassification) {
 
 function markChatDirty(binding = captureChatBinding()) {
     if (!binding) return null;
-    let record = [...chatSaveRecords].find(candidate => areChatBindingsEqual(candidate.binding, binding));
+    const revision = JSON.stringify(binding.chat);
+    let record = [...chatSaveRecords].find(candidate => areChatBindingsEqual(candidate.binding, binding)
+        && ((candidate.binding.chat === binding.chat && candidate.chatGeneration === attributionChatGeneration)
+            || candidate.revision === revision));
+    if (record?.dirty && record.revision === revision) return record;
     if (!record) {
         record = {
             binding,
@@ -225,6 +248,8 @@ function markChatDirty(binding = captureChatBinding()) {
         chatSaveRecords.add(record);
     }
     record.binding = binding;
+    record.revision = revision;
+    record.chatGeneration = attributionChatGeneration;
     record.version++;
     record.dirty = true;
     const now = Date.now();
@@ -311,7 +336,8 @@ async function saveChatRecord(record, forceRetry) {
 
     const saveBinding = record.binding;
     const context = getContext();
-    if (!isChatBindingCurrent(saveBinding, context) || typeof context?.saveChat !== 'function') {
+    if (!isChatBindingCurrent(saveBinding, context) || typeof context?.saveChat !== 'function'
+        || JSON.stringify(context.chat) !== record.revision) {
         syncPendingChatSaveState();
         return false;
     }
@@ -340,7 +366,8 @@ async function saveChatRecord(record, forceRetry) {
 
     const hostSettlement = new Promise(resolve => {
         const saveContext = getContext();
-        if (!isChatBindingCurrent(saveBinding, saveContext) || typeof saveContext?.saveChat !== 'function') {
+        if (!isChatBindingCurrent(saveBinding, saveContext) || typeof saveContext?.saveChat !== 'function'
+            || JSON.stringify(saveContext.chat) !== record.revision) {
             resolve({ accepted: false, confirmed: false, uncertain: false, error: new Error('Captured chat is no longer current.') });
             return;
         }
@@ -363,7 +390,7 @@ async function saveChatRecord(record, forceRetry) {
         if (outcome.accepted) {
             if (outcome.confirmed) record.confirmedVersion = Math.max(record.confirmedVersion || 0, operation.savedVersion);
             // Promise<void> is terminal but not durable confirmation. Clear it
-            // rather than retrying forever; callers treat it as confirmed.
+            // rather than retrying forever; callers retain the shipped toast behaviour.
             completeChatSaveOperation(record, operation);
         }
         else deferUnconfirmedChatSave(record, operation, outcome);
@@ -486,10 +513,11 @@ export function queueChatSave() {
 export function flushChatSave() {
     clearChatSaveTimer();
     const binding = captureChatBinding();
-    const record = binding
-        ? [...chatSaveRecords].find(candidate => areChatBindingsEqual(candidate.binding, binding))
-        : null;
-    return record ? saveChatRecord(record, true) : Promise.resolve(true);
+    const records = binding
+        ? [...chatSaveRecords].filter(candidate => candidate.dirty && areChatBindingsEqual(candidate.binding, binding))
+        : [];
+    const record = records.find(candidate => candidate.revision === JSON.stringify(binding.chat));
+    return record ? saveChatRecord(record, true) : Promise.resolve(records.length === 0);
 }
 
 export function buildGlobalColorAssignmentLookup(chat) {
@@ -1179,7 +1207,15 @@ export function fillUncoloredDialogueGaps(rawText, messageSpeakerName = '', opti
     }
 
     const narratorColor = getNarratorVisual(settings, applyThemeReadabilityAndBrightness)?.color || null;
-    const metadata = formatValidatedColorMetadata(getValidatedAssignmentsForColors(parseCanonicalFontMarkup(updatedText)?.colors, narratorColor));
+    // A span the model already wrote may use a colour the character no longer
+    // has; its original trailing mapping is the only record that knows whose
+    // colour it was. Preserve those for untouched spans only: gap spans get
+    // fresh registry colours and must never inherit a stale historical name.
+    const untouchedSpanColors = new Set(parsed.spans.map(span => normalizeHexColor(span.color, null)));
+    const preservedAssignments = parseNamedColorAssignmentsFromText(source)
+        .filter(assignment => untouchedSpanColors.has(normalizeHexColor(assignment.color, null)));
+    const metadata = formatValidatedColorMetadata(getValidatedAssignmentsForColors(
+        parseCanonicalFontMarkup(updatedText)?.colors, narratorColor, [], preservedAssignments));
     if (metadata && !parseTrailingColorMetadata(updatedText)) updatedText += `\n[COLORS:${metadata}]`;
     return {
         updatedText,
@@ -1228,48 +1264,10 @@ export function restoreColorizedToolCallText(rawText) {
     return parsed.projection;
 }
 
-// A name that survives only inside a tool-call message's color block was created by the bug, not
-// by the chat. Resolved by name rather than against a hardcoded "SillyTavern System" so this
-// stays correct on hosts that label the system user differently.
-function removeUnreferencedCharacterEntries(candidateNames, chat) {
-    const referencedKeys = new Set();
-    const referencedColors = new Set();
-    for (const msg of chat) {
-        if (isHostSystemOrToolMessage(msg)) continue;
-        const authorKey = resolveCharacterKeyByNameOrAlias(String(msg?.name ?? '').trim());
-        if (authorKey) referencedKeys.add(authorKey);
-        const text = msg?.mes || '';
-        if (!text) continue;
-        for (const { name } of (msg?.is_user ? [] : parseNamedColorAssignmentsFromText(text))) {
-            const key = resolveCharacterKeyByNameOrAlias(name);
-            if (key) referencedKeys.add(key);
-        }
-        for (const color of collectFontColorsFromText(text)) referencedColors.add(color);
-    }
-
-    const removed = [];
-    for (const name of candidateNames) {
-        const key = resolveCharacterKeyByNameOrAlias(name);
-        const entry = key ? characterColors[key] : null;
-        // Keep is the user's explicit "protect this entry" flag. Deliberately not gated on
-        // locked: processColorPairs creates a detected entry with
-        // locked: settings.autoLockDetected !== false, which defaults to true, so a lock guard
-        // would refuse to clean up every entry the bug made.
-        if (!entry || entry.keep === true) continue;
-        if (referencedKeys.has(key)) continue;
-        if (referencedColors.has(normalizeHexColor(getEntryEffectiveColor(entry), null))) continue;
-        delete characterColors[key];
-        removed.push(key);
-    }
-    if (removed.length) clearSpeakerRegexCache();
-    return removed;
-}
-
 export function repairColorizedToolCallMessages(chat = getContext()?.chat) {
     const report = { repairedIndices: [], removedCharacterKeys: [] };
     if (!Array.isArray(chat) || !chat.length) return report;
 
-    const candidateNames = new Set();
     for (let i = 0; i < chat.length; i++) {
         const msg = chat[i];
         if (!isToolCallMessage(msg)) continue;
@@ -1279,23 +1277,16 @@ export function repairColorizedToolCallMessages(chat = getContext()?.chat) {
         const restored = restoreColorizedToolCallText(rawText);
         if (restored === null || restored === rawText) continue;
 
-        // Read the names off the block before it is dropped. msg.name is the host's system user,
-        // which the speaker pre-registration loops registered separately.
-        for (const { name } of parseNamedColorAssignmentsFromText(rawText)) candidateNames.add(name);
-        if (msg.name) candidateNames.add(msg.name);
         msg.mes = restored;
         report.repairedIndices.push(i);
     }
-    if (!report.repairedIndices.length) return report;
-
-    report.removedCharacterKeys = removeUnreferencedCharacterEntries(candidateNames, chat);
+    // A repaired block proves nothing about an entry's origin in a shared table.
+    // Preserve the registry, including customised characters absent from this chat.
     return report;
 }
 
 export async function applyToolCallMessageRepair(options = {}) {
     const chat = getContext()?.chat;
-    // Synchronous, so the registry is final before the first await and updateCharList and
-    // injectPrompt downstream of the caller both see the cleaned-up list.
     const report = repairColorizedToolCallMessages(chat);
     const count = report.repairedIndices.length;
     if (!count) {
@@ -1326,6 +1317,9 @@ export function repairHtmlBreakingColorSpans(chat = getContext()?.chat) {
     for (let i = 0; i < chat.length; i++) {
         const msg = chat[i];
         if (isHostSystemOrToolMessage(msg)) continue;
+        // User messages are never written by this extension; formatting inside
+        // them is user-authored and must stay byte-identical.
+        if (msg?.is_user) continue;
         const rawText = msg?.mes || '';
         // Cheap reject: an undamaged message has no closing font tag to have been misplaced.
         if (!/<\/font\s*>/i.test(rawText)) continue;
@@ -1375,6 +1369,8 @@ export function repairOverreachingColorSpans(chat = getContext()?.chat) {
     for (let i = 0; i < chat.length; i++) {
         const msg = chat[i];
         if (isHostSystemOrToolMessage(msg)) continue;
+        // User-authored formatting is off limits, same as the HTML repair sweep.
+        if (msg?.is_user) continue;
         const trimmed = trimOverreachingColorSpans(msg?.mes || '', { silent: true });
         if (!trimmed.changed) continue;
         msg.mes = trimmed.updatedText;
@@ -1403,6 +1399,20 @@ export function shouldUseLocalColorizeFallback(llmResult) {
     return !llmResult || llmResult.colorized !== true;
 }
 
+// The message author is part of the colouring contract: without it, two
+// identical messages by different speakers submit the same prompt and the
+// model cannot tell which author goes with which quote.
+function buildDefaultSpeakerPair(trimmedSpeaker) {
+    for (const entry of filterPromptCharacterEntries(Object.values(characterColors))) {
+        const safeEntryName = normalizeRegistryIdentityName(entry.name);
+        if (safeEntryName && safeEntryName.toLowerCase() === trimmedSpeaker.toLowerCase()) {
+            const color = getEntryEffectiveColor(entry);
+            return formatColorBlockPair(entry.name, color, entry);
+        }
+    }
+    return formatColorBlockPair(trimmedSpeaker, null);
+}
+
 export async function colorizeMessageWithLLM(rawText, messageSpeakerName = '') {
     if (typeof generateQuietPrompt !== 'function') return null;
     if (String(rawText ?? '').length > COLORIZE_BATCH_MAX_CHARACTERS) return null;
@@ -1410,17 +1420,10 @@ export async function colorizeMessageWithLLM(rawText, messageSpeakerName = '') {
     // Build character-color list from known entries
     const charList = [];
     const trimmedSpeaker = String(messageSpeakerName ?? '').trim();
-    let defaultSpeakerColor = null;
-    let defaultSpeakerEntry = null;
     for (const entry of filterPromptCharacterEntries(Object.values(characterColors))) {
         const color = getEntryEffectiveColor(entry);
         const pair = formatColorBlockPair(entry.name, color, entry);
         if (pair) charList.push(pair);
-        const safeEntryName = normalizeRegistryIdentityName(entry.name);
-        if (safeEntryName && safeEntryName.toLowerCase() === trimmedSpeaker.toLowerCase()) {
-            defaultSpeakerColor = color;
-            defaultSpeakerEntry = entry;
-        }
     }
     const narratorColor = getNarratorVisual(settings, applyThemeReadabilityAndBrightness)?.color || null;
     if (narratorColor) charList.push(formatColorBlockPair('Narrator', narratorColor));
@@ -1437,9 +1440,7 @@ export async function colorizeMessageWithLLM(rawText, messageSpeakerName = '') {
     lines.push(`Known speakers and colors: ${charList.join(', ')}`);
     if (thoughtSymbols.length) lines.push(`- ${buildThoughtSymbolColorPromptRule(thoughtSymbols)}`);
     if (narratorColor) lines.push(`- Narrator text: <font color="${narratorColor}">...</font>.`);
-    const defaultSpeakerPair = defaultSpeakerEntry
-        ? formatColorBlockPair(defaultSpeakerEntry.name, defaultSpeakerColor, defaultSpeakerEntry)
-        : formatColorBlockPair(trimmedSpeaker, defaultSpeakerColor);
+    const defaultSpeakerPair = buildDefaultSpeakerPair(trimmedSpeaker);
     if (defaultSpeakerPair) lines.push(`- Default speaker (message author): ${defaultSpeakerPair}.`);
     lines.push('');
     lines.push(rawText);
@@ -1534,8 +1535,10 @@ export async function colorizeMultipleMessagesWithLLM(messageBatch) {
     lines.push('');
 
     // Add all messages with markers
-    messageBatch.forEach(({ rawText }, idx) => {
+    messageBatch.forEach(({ rawText, speakerName }, idx) => {
+        const defaultSpeakerPair = buildDefaultSpeakerPair(String(speakerName ?? '').trim());
         lines.push(`[MSG:${idx}]`);
+        if (defaultSpeakerPair) lines.push(`Default speaker (message author): ${defaultSpeakerPair}.`);
         lines.push(rawText);
         lines.push('');
     });
@@ -1910,6 +1913,8 @@ export async function colorizeMessages(targetMode = 'all') {
                 }
 
                 for (const entry of batch) {
+                    if (!isColorizeRunCurrent(run)) return;
+                    if (!isColorizeMessageCurrent(chat, entry)) continue;
                     const result = completeLLMResultGaps(resultsByIndex.get(entry.msgIndex), entry.speakerName);
                     if (!result) {
                         fallbackEntries.push(entry);
@@ -2026,16 +2031,19 @@ export async function colorizeMessages(targetMode = 'all') {
     }
 }
 
-export function onNewMessage(indexArg = null, messageArg = null, chatArg = null) {
-    if (!settings.enabled || !settings.autoScanNewMessages) return;
+export function onNewMessage(indexArg = null, messageArg = null, chatArg = null, retryTarget = null) {
+    if (!settings.enabled || !settings.autoScanNewMessages) {
+        pendingAutoColorizeRetryTargets.length = 0;
+        return;
+    }
     const scheduledContext = getContext();
     const scheduledChat = chatArg ?? scheduledContext?.chat;
     const scheduledIndex = Number.isInteger(indexArg) && indexArg >= 0 ? indexArg : null;
     const scheduledMessage = messageArg
         ?? (Array.isArray(scheduledChat) && scheduledIndex !== null ? scheduledChat[scheduledIndex] : null);
-    const scheduledStorageKey = getStorageKey();
-    const scheduledChatGeneration = attributionChatGeneration;
-    setTimeout(async () => {
+    const scheduledStorageKey = retryTarget ? retryTarget.storageKey : getStorageKey();
+    const scheduledChatGeneration = retryTarget ? retryTarget.chatGeneration : attributionChatGeneration;
+    const processMessage = async () => {
         const ctx = getContext();
         if (!settings.enabled || !settings.autoScanNewMessages
             || ctx?.chat !== scheduledChat || getStorageKey() !== scheduledStorageKey
@@ -2046,12 +2054,38 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
         const index = scheduledIndex ?? chat.length - 1;
         const lastMsg = scheduledMessage ?? chat[index];
         if (!lastMsg || chat[index] !== lastMsg) return;
+        if (retryTarget && (!isColorizeMessageCurrent(chat, retryTarget)
+            || !isColorizeRunCurrencyCurrent(retryTarget.currency, true))) return;
         if (isHostSystemOrToolMessage(lastMsg)) return;
         if (!isColorableMessage(lastMsg)) {
             scheduleDomRefreshSeries(0);
             return;
         }
         const text = lastMsg?.mes || '';
+        const messageEntry = {
+            rawText: text,
+            speakerName: lastMsg.name,
+            msgIndex: index,
+            message: lastMsg,
+            messageHash: hashMessageText(text),
+            messageId: lastMsg.id ?? null,
+            sendDate: lastMsg.send_date ?? null,
+            swipeId: lastMsg.swipe_id ?? null,
+            chatGeneration: scheduledChatGeneration,
+        };
+        let expectedText = text;
+        const isNewMessageTargetCurrent = () => settings.enabled && settings.autoScanNewMessages
+            && isCapturedChatBindingCurrent(chatBinding)
+            && getStorageKey() === scheduledStorageKey
+            && isColorizeMessageCurrent(chat, messageEntry, expectedText);
+        const queueRetry = () => queuePendingAutoColorizeRetry({
+            ...messageEntry,
+            rawText: expectedText,
+            messageHash: hashMessageText(expectedText),
+            chat,
+            storageKey: scheduledStorageKey,
+            currency: captureColorizeRunCurrency(true),
+        });
         const sigId = lastMsg?.id ?? lastMsg?.send_date ?? '';
         const signature = `${chat.length}|${sigId}|${text}`;
         if (signature === lastProcessedMessageSignature) {
@@ -2063,7 +2097,7 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
         // arrives uncolored and the colorize pass below is the only thing that colors it.
         const shouldAutoColorize = settings.autoColorize === true || getEffectivePromptMode() === 'profile';
         if (shouldAutoColorize && isColorableMessage(lastMsg) && isAutoColorizing && !parseTrailingColorMetadata(text)) {
-            pendingAutoColorizeRetry = true;
+            queueRetry();
             setLastProcessedMessageSignature('');
             return;
         }
@@ -2075,6 +2109,10 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
         // font tags to the same message, and an added-up total would miss them.
         syncDialogueCounts(chat);
         const foundColorBlock = colorStats.foundColorBlock;
+        // A trailing metadata block does not colour dialogue by itself. Basing the
+        // auto-colorize decision on the block alone leaves profile-mode replies that
+        // carry only a block (no font tags) permanently uncolored.
+        const hasActualColorSpans = collectFontColorsFromText(text).size > 0;
         const hadRemapping = colorStats.hadRemapping;
         const remappedAssignments = colorStats.remappedAssignments;
         if (registryBeforeIngest !== getPersistentRegistryFingerprint()) saveData();
@@ -2108,6 +2146,7 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
                 const latestRemap = updateTextColorReferences(latestTextForRemap, remapReplacements);
                 if (latestRemap.changed) {
                     lastMsg.mes = latestRemap.updatedText;
+                    expectedText = lastMsg.mes;
                     setLastProcessedMessageSignature(`${chat.length}|${sigId}|${lastMsg.mes}`);
                     latestRemapChanged = true;
                     void queueCapturedChatSave(chatBinding);
@@ -2121,8 +2160,15 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
         // Keep chat colors in sync when receive-time color conflict remapping happens.
         if (hadRemapping && settings.autoRecolor) {
             if (isDomEngine()) scheduleDomRefreshSeries(0);
-            else await recolorAllMessages();
+            else {
+                // Recolor mutates synchronously before awaiting its save. Only
+                // those edits, not changes during the wait, become our input.
+                const recoloring = recolorAllMessages();
+                expectedText = lastMsg.mes;
+                await recoloring;
+            }
         }
+        if (!isNewMessageTargetCurrent()) return;
 
         if (isDomEngine()) {
             scheduleDomRefreshSeries(0);
@@ -2131,6 +2177,7 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
         if (latestRemapChanged) {
             await queueCapturedChatSave(chatBinding, { immediate: true });
         }
+        if (!isNewMessageTargetCurrent()) return;
 
         // The model colored some dialogue but not all of it, or ran a span past the dialogue
         // it opened on: finish the message locally. Mutually exclusive with the auto-colorize
@@ -2139,15 +2186,9 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
             const completionInput = lastMsg.mes || text;
             if (collectFontColorsFromText(completionInput).size > 0) {
                 const completionEntry = {
+                    ...messageEntry,
                     rawText: completionInput,
-                    speakerName: lastMsg.name,
-                    message: lastMsg,
-                    msgIndex: index,
                     messageHash: hashMessageText(completionInput),
-                    messageId: lastMsg.id ?? null,
-                    sendDate: lastMsg.send_date ?? null,
-                    swipeId: lastMsg.swipe_id ?? null,
-                    chatGeneration: attributionChatGeneration,
                 };
                 // Trimmed before the fill, not after: the fill counts a segment overlapping an
                 // existing span as covered, so narration swallowed into a span would read as
@@ -2163,25 +2204,25 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
                     && isCapturedChatBindingCurrent(chatBinding)
                     && isColorizeMessageCurrent(chat, completionEntry)) {
                     lastMsg.mes = completion.updatedText;
+                    expectedText = lastMsg.mes;
                     setLastProcessedMessageSignature(`${chat.length}|${sigId}|${lastMsg.mes}`);
                     syncDialogueCounts(chat);
                     await queueCapturedChatSave(chatBinding, { immediate: true });
-                    if (isCapturedChatBindingCurrent(chatBinding)
-                        && isColorizeMessageCurrent(chat, completionEntry, completion.updatedText)) {
-                        await refreshMessageDom(index, lastMsg);
-                    }
+                    if (!isNewMessageTargetCurrent()) return;
+                    await refreshMessageDom(index, lastMsg);
+                    if (!isNewMessageTargetCurrent()) return;
                     updateCharList();
                 }
             }
         }
 
         // Auto-colorize fallback: if model produced no color output at all
-        if (!foundColorBlock && shouldAutoColorize && isColorableMessage(lastMsg) && isAutoColorizing) {
-            pendingAutoColorizeRetry = true;
+        if ((!foundColorBlock || !hasActualColorSpans) && shouldAutoColorize && isColorableMessage(lastMsg) && isAutoColorizing) {
+            queueRetry();
             setLastProcessedMessageSignature('');
             return;
         }
-        if (!foundColorBlock && shouldAutoColorize && isColorableMessage(lastMsg)) {
+        if ((!foundColorBlock || !hasActualColorSpans) && shouldAutoColorize && isColorableMessage(lastMsg)) {
             const hasExistingColors = collectFontColorsFromText(text).size > 0;
             if (!hasExistingColors) {
                 setIsAutoColorizing(true);
@@ -2195,17 +2236,13 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
                 const colorizeInput = lastMsg.mes || text;
                 const autoColorizeBinding = chatBinding;
                 const autoColorizeEntry = {
+                    ...messageEntry,
                     rawText: colorizeInput,
-                    speakerName: lastMsg.name,
-                    msgIndex: mesIndex,
-                    message: lastMsg,
                     messageHash: hashMessageText(colorizeInput),
-                    messageId: lastMsg.id ?? null,
-                    sendDate: lastMsg.send_date ?? null,
-                    swipeId: lastMsg.swipe_id ?? null,
-                    chatGeneration: attributionChatGeneration,
                 };
                 try {
+                    if (!isCapturedChatBindingCurrent(autoColorizeBinding)
+                        || !isColorizeMessageCurrent(capturedChat, autoColorizeEntry)) return;
                     syncAllEffectiveColors();
                     // Pre-register all unique colorable speaker names for attribution
                     let preRegisteredCharacters = false;
@@ -2218,10 +2255,14 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
                         }
                     }
                     if (!isCapturedChatBindingCurrent(autoColorizeBinding)
-                        || !isColorizeMessageCurrent(capturedChat, autoColorizeEntry)) return;
+                        || !isColorizeMessageCurrent(capturedChat, autoColorizeEntry)) {
+                        // ponytail: never commit names from a stale chat into the new table.
+                        return;
+                    }
                     if (preRegisteredCharacters) commit();
                     let autoColorizeCurrency = captureColorizeRunCurrency(true);
                     const isAutoColorizeTargetCurrent = (expectedText = colorizeInput) => isCapturedChatBindingCurrent(autoColorizeBinding)
+                        && getStorageKey() === scheduledStorageKey
                         && isColorizeMessageCurrent(capturedChat, autoColorizeEntry, expectedText)
                         && isColorizeRunCurrencyCurrent(autoColorizeCurrency, true);
                     // Try LLM path first, fall back to regex
@@ -2263,12 +2304,20 @@ export function onNewMessage(indexArg = null, messageArg = null, chatArg = null)
                     setIsAutoColorizing(false);
                     hideAutoColorizeIndicator(lastMesEl);
                     clearAutoColorizeIndicators();
-                    if (pendingAutoColorizeRetry) {
-                        pendingAutoColorizeRetry = false;
-                        onNewMessage();
-                    }
                 }
             }
         }
+    };
+    setTimeout(() => {
+        void processMessage().catch(error => {
+            console.error('[Dialogue Colors] New-message processing failed:', error);
+        }).finally(() => {
+            // All exits advance the queue, including stale and ineligible targets.
+            // A busy callback leaves it to the active request instead of requeuing.
+            if (!isAutoColorizing && pendingAutoColorizeRetryTargets.length) {
+                const next = pendingAutoColorizeRetryTargets.shift();
+                onNewMessage(next.msgIndex, next.message, next.chat, next);
+            }
+        });
     }, 600);
 }

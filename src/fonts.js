@@ -1,5 +1,6 @@
 // fonts.js - extracted from index.js (mechanical split)
-import { buildColorFontLookup, buildColorRenderingLookup, refreshTransientNarratorCount, resolveCharacterKeyByNameOrAlias } from './color-blocks.js';
+import { isHostSystemOrToolMessage } from './attribution-store.js';
+import { buildColorRenderingLookup, refreshTransientNarratorCount, resolveCharacterKeyByNameOrAlias } from './color-blocks.js';
 import { applyGradientText, clearGradientText, getVisualRenderState } from './gradient-rendering.js';
 import { getContext } from './st-api.js';
 import { characterColors, loadedGoogleFonts, settings } from './state.js';
@@ -108,10 +109,10 @@ export function loadGoogleFont(fontName, { wait = false } = {}) {
     };
     link.onerror = () => {
         loadedGoogleFonts.delete(key);
-        // Release the request slot so one unreachable font cannot exhaust the
-        // budget for every other font. The failed link stays in the document and
-        // keeps acting as the dedup guard against re-requesting this family.
-        remoteFontRequests.delete(key);
+        // The disclosed cap bounds attempted requests, not just successful
+        // ones: a failed family keeps its slot so retries cannot cycle fresh
+        // families through the budget forever. The retained failed link still
+        // dedups re-requests of this same family.
         link.dataset.dcGoogleFontState = 'failed';
         link.disabled = true;
         link.onload = null;
@@ -271,13 +272,12 @@ export function clearCustomFontsFromFontTags(root = document) {
 export function applyCustomFontsToFontTags(mesText, rawText = '') {
     const fontTags = Array.from(mesText?.querySelectorAll?.('font[color]') || []);
     if (!fontTags.length) return false;
-    const fontByColor = buildColorFontLookup(rawText);
     const renderingByColor = buildColorRenderingLookup(rawText);
     let changed = false;
     for (const fontEl of fontTags) {
         const color = normalizeHexColor(fontEl.getAttribute('color'), null);
         const rendering = color ? renderingByColor.get(color) : null;
-        const font = color ? fontByColor.get(color) || '' : '';
+        const font = rendering?.entry?.font || '';
         const family = getGoogleFontFamily(font);
         if (family) {
             loadGoogleFont(font);
@@ -319,7 +319,9 @@ export function applyCustomFontsToMessageElement(mesElement, chat = getContext()
     if (!settings.enabled) return clearCustomFontsFromFontTags(mesText);
     const mesIndex = Number(mesElement.getAttribute?.('mesid'));
     const msg = Number.isFinite(mesIndex) ? chat[mesIndex] : null;
-    if (msg?.is_system) return clearCustomFontsFromFontTags(mesText);
+    // /hide also sets is_system, so hidden ordinary messages must keep their
+    // styling; only genuine host system/tool payloads are cleared.
+    if (isHostSystemOrToolMessage(msg)) return clearCustomFontsFromFontTags(mesText);
     return applyCustomFontsToFontTags(mesText, msg?.mes || mesText.innerHTML || '');
 }
 

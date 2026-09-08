@@ -14,6 +14,7 @@ import {
     pickRandomGradientType,
 } from '../src/gradients.js';
 import { advanceGradientGenerator, createGradientRandom } from '../src/seeded-gradient-generator.js';
+import { resolveVisual } from '../src/visual-resolver.js';
 
 const presetEntries = Object.entries(BUILTIN_GRADIENT_PRESETS);
 
@@ -166,6 +167,16 @@ test('an exhausted palette still yields a gradient rather than throwing', () => 
     const gradient = buildRandomGradient('#884422', { palette: ['#112233'], reservedColors, totalStops: 3 });
     assert.ok(gradient);
     assert.equal(gradient.stops.length, 2);
+});
+
+test('a collapsed transform returns a deterministic flat gradient with valid stops', () => {
+    const options = { totalStops: 5, transformColor: () => '#000000' };
+    const gradient = buildRandomGradient('#888888', options, seededRandom('collapse'));
+    assert.deepEqual(gradient, buildRandomGradient('#888888', options, seededRandom('collapse')));
+    assert.equal(gradient.stops.length, 4);
+    assert.deepEqual(gradient, normalizeGradient(gradient));
+    assert.ok(gradient.stops.every(stop => stop.baseColor === '#888888' && stop.color === '#888888'));
+    assert.equal(resolveVisual({ color: '#888888', gradient }).gradientCss, null);
 });
 
 test('hue spread widens the colors two characters can draw from one palette', () => {

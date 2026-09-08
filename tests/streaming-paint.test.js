@@ -43,8 +43,9 @@ const hooks = registerHooks({
 });
 
 const { attributeDialogueSegments, balanceStreamingText } = await import('../src/attribution.js');
-const { applySegmentDecoration, getMessageDomReadiness, getStreamingAttributionOverrides, matchSegmentsToElements, setMessageQuoteOverride, setStreamingAttributionOverride } = await import('../src/dom-engine.js');
+const { acceptAttributionReview, applySegmentDecoration, getMessageAttributionFreezeSegments, getMessageDomReadiness, getStreamingAttributionOverrides, isMessageAttributionVerified, markMessageAttributionVerified, matchSegmentsToElements, setMessageQuoteOverride, setStreamingAttributionOverride, deleteMessageQuoteOverride, upsertAttributionReview } = await import('../src/dom-engine.js');
 const { applyCustomFontsToFontTags } = await import('../src/fonts.js');
+const { applyThemeReadabilityAndBrightness, getContrastRatio, invalidateThemeCache } = await import('../src/palettes.js');
 const { characterColors, resetStreamingSession, settings, streamingSession } = await import('../src/state.js');
 const { beginStreamingPaint, endStreamingPaint, paintStreamingMessage } = await import('../src/streaming-paint.js');
 const { cancelStreamingAttributionVerification } = await import('../src/verify.js');
@@ -153,6 +154,7 @@ test('balancing closes a half-typed delimiter and leaves complete text alone', (
     assert.equal(balanceStreamingText('He said "Hel   '), 'He said "Hel"');
     // Code fences never render as <q> or <em>, so they are left as-is.
     assert.equal(balanceStreamingText('```js'), '```js');
+    assert.equal(balanceStreamingText('<span title="*"></span>Bob: *thought'), '<span title="*"></span>Bob: *thought*');
 });
 
 test('a half-typed quote is segmented the same way the host renders it', () => {
@@ -398,6 +400,54 @@ test('a growing segment keeps its first painted speaker', () => {
     }
 });
 
+test('manual and review assignments freeze the painted sibling, not the later heuristic', () => {
+    for (const mode of ['manual', 'review', 'transient']) {
+        const message = { id: 'm-1', swipe_id: 0, name: 'Alice', mes: EARLY_TICK };
+        const metadata = {};
+        const context = { chat: [message], chatMetadata: metadata };
+        setTestContext(context);
+        withCharacters(['Alice', 'Bob'], () => {
+            const quotes = [fakeElement('Fine.'), fakeElement('Second.')];
+            const mesText = fakeElement('Fine.');
+            mesText.querySelectorAll = selector => selector === 'q' ? quotes : [];
+            armSession();
+            streamingSession.mesElement = {
+                isConnected: true, getAttribute: () => '0', querySelector: () => mesText,
+            };
+            streamingSession.mesText = mesText;
+            assert.equal(paintStreamingMessage(), true);
+            message.mes = `${LATER_TICK}\n\nAlice said "Second."`;
+            assert.equal(paintStreamingMessage(), true);
+            assert.equal(quotes[0].getAttribute('data-dc-speaker'), 'bob');
+            assert.equal(streamingSession.assignments.size, 0, 'the heuristic cache is not the painted cache');
+            assert.equal(attributeDialogueSegments(message.mes, message.name).segments[0].assignment.name, 'Alice');
+            assert.equal(getMessageAttributionFreezeSegments(0, message, 1)['0'], 'Bob');
+
+            if (mode === 'manual') {
+                setMessageQuoteOverride(0, message, 1, 'Bob', { freezeSegments: getMessageAttributionFreezeSegments(0, message, 1) });
+            } else if (mode === 'review') {
+                const segment = attributeDialogueSegments(message.mes, message.name).segments[1];
+                const review = upsertAttributionReview({ message, messageIndex: 0, segment, proposedSpeaker: 'Bob', source: 'llm' });
+                assert.equal(acceptAttributionReview(review.id)?.status, 'accepted');
+            } else {
+                setStreamingAttributionOverride(0, message, 1, 'Bob');
+            }
+            assert.equal(paintStreamingMessage(), true);
+            assert.equal(quotes[0].getAttribute('data-dc-speaker'), 'bob', mode);
+            assert.equal(quotes[1].getAttribute('data-dc-speaker'), 'bob', mode);
+            if (mode !== 'transient') assert.equal(metadata.dialogue_colors_overrides['0'].segments['0'], 'Bob');
+
+            const replacement = { ...message };
+            setTestContext({ chat: [replacement], chatMetadata: {} });
+            assert.equal(getMessageAttributionFreezeSegments(0, replacement, 1)['0'], 'Alice', 'another message cannot inherit painted guesses');
+            setTestContext(context);
+            message.swipe_id = 1;
+            assert.equal(getMessageAttributionFreezeSegments(0, message, 1)['0'], 'Alice', 'another swipe cannot inherit painted guesses');
+        });
+    }
+    setTestContext({ chat: [], chatMetadata: {} });
+});
+
 test('a captured streaming session rejects a replaced chat root before painting', () => {
     const originalDocument = globalThis.document;
     const originalMutationObserver = globalThis.MutationObserver;
@@ -465,6 +515,60 @@ test('health readiness rejects wiped owned styles', () => {
             assert.equal(getMessageDomReadiness(mesElement, message, 0).correctDecorations, 0);
         });
     } finally {
+        setTestContext({ chat: [], chatMetadata: {} });
+    }
+});
+
+test('grey-surface repaint removes unsafe solid and gradient highlights without leaving background residue', () => {
+    const originalComputedStyle = globalThis.getComputedStyle;
+    const previousSettings = { ...settings };
+    let surface = '#202328';
+    globalThis.getComputedStyle = () => ({ backgroundColor: surface });
+    const message = { id: 'grey-highlight', name: 'Alice', mes: 'Alice said "Hello."' };
+    setTestContext({ chat: [message], chatMetadata: {} });
+    try {
+        withCharacters(['Alice'], () => {
+            Object.assign(settings, { themeMode: 'auto', highlightMode: true, colorVisionPreviewMode: 'none', driftAllGradientColors: false, forceBoldText: false });
+            for (const gradient of [false, true]) {
+                surface = '#202328';
+                invalidateThemeCache();
+                const entry = characterColors.alice;
+                entry.color = '#eeeeee';
+                if (gradient) entry.gradient = { type: 'linear', stops: [{ color: '#dddddd', position: 100 }] };
+                const quote = fakeElement('"Hello."');
+                const segment = { index: 0, confidence: 0.9, assignment: { key: 'alice', name: 'Alice', color: entry.color } };
+                applySegmentDecoration(segment, quote);
+                const property = gradient ? '--dc-gradient-highlight' : 'background-color';
+                assert.equal(quote.style.getPropertyValue(property), '#eeeeee26', 'fixture starts with a painted highlight');
+
+                surface = '#777777';
+                invalidateThemeCache();
+                entry.color = applyThemeReadabilityAndBrightness('#eeeeee');
+                if (gradient) entry.gradient.stops[0].color = entry.color === '#000000' ? '#050505' : '#000000';
+                applySegmentDecoration(segment, quote);
+                assert.ok(getContrastRatio(quote.style.getPropertyValue('color'), surface) >= 4.5);
+                assert.equal(quote.style.getPropertyValue('background-color'), '');
+                assert.equal(quote.getAttribute('data-dc-highlight-state'), null);
+                assert.equal(quote.style.getPropertyValue('--dc-gradient-highlight'), '');
+                assert.equal(quote.classList.contains('dc-gradient-highlight'), false);
+                assert.equal(quote.classList.contains('dc-gradient-text'), gradient);
+
+                quote.writes = 0;
+                applySegmentDecoration(segment, quote);
+                assert.equal(quote.writes, 0, 'an unchanged safe repaint is a no-op');
+                const mesText = {
+                    querySelector: () => null,
+                    querySelectorAll: selector => selector === 'q' || selector === '[data-dc-colored]' ? [quote] : [],
+                };
+                const mesElement = { querySelector: () => mesText };
+                assert.equal(getMessageDomReadiness(mesElement, message, 0).correctDecorations, 1,
+                    'omitting an unsafe highlight must not trigger endless repairs');
+            }
+        });
+    } finally {
+        globalThis.getComputedStyle = originalComputedStyle;
+        Object.assign(settings, previousSettings);
+        invalidateThemeCache();
         setTestContext({ chat: [], chatMetadata: {} });
     }
 });
@@ -567,6 +671,86 @@ test('generation-end cancellation drops provisional streaming overrides', () => 
         assert.equal(getStreamingAttributionOverrides(0, message)?.['0'], 'Alice');
         cancelStreamingAttributionVerification();
         assert.equal(getStreamingAttributionOverrides(0, message), null);
+    } finally {
+        setTestContext({ chat: [], chatMetadata: {} });
+    }
+});
+
+test('provisional overrides and local verification cannot outlive their thought configuration', () => {
+    const message = { id: 'configured-stream', name: 'Bob', mes: '*Bob waits.* "Hello." "Goodbye."' };
+    setTestContext({ chat: [message], chatMetadata: {} });
+    try {
+        withCharacters(['Alice', 'Bob'], () => {
+            assert.equal(setStreamingAttributionOverride(0, message, 1, 'Alice'), true);
+            assert.equal(getStreamingAttributionOverrides(0, message)['1'], 'Alice');
+            markMessageAttributionVerified(0, message, 'clean', { persist: false });
+            assert.equal(isMessageAttributionVerified(0, message), true);
+            settings.thoughtSymbols = '';
+            assert.equal(getStreamingAttributionOverrides(0, message), null);
+            assert.equal(isMessageAttributionVerified(0, message), false);
+            settings.thoughtSymbols = '*';
+            assert.equal(getStreamingAttributionOverrides(0, message)['1'], 'Alice');
+            assert.equal(isMessageAttributionVerified(0, message), true);
+        });
+    } finally {
+        cancelStreamingAttributionVerification();
+        setTestContext({ chat: [], chatMetadata: {} });
+    }
+});
+
+test('repainting an unchanged weak guess keeps its low confidence', () => {
+    const message = { id: 'm-1', mes: 'The note had been left for Alice. "Hello."', name: 'Dana' };
+    setTestContext({ chat: [message], chatMetadata: {} });
+    try {
+        withCharacters(['Dana', 'Alice'], () => {
+            const quote = fakeElement('Hello.');
+            const mesText = fakeElement('Hello.');
+            mesText.querySelectorAll = selector => selector === 'q' ? [quote] : [];
+            armSession();
+            streamingSession.mesElement = {
+                isConnected: true,
+                getAttribute: name => name === 'mesid' ? '0' : null,
+                querySelector: selector => selector === '.mes_text' ? mesText : null,
+            };
+            streamingSession.mesText = mesText;
+            assert.equal(paintStreamingMessage(), true);
+            const firstBand = quote.getAttribute('data-dc-confidence');
+            assert.ok(firstBand, 'the first paint records a confidence band');
+            assert.notEqual(firstBand, 'high', 'the fixture starts as a weak guess');
+
+            assert.equal(paintStreamingMessage(), true);
+            assert.equal(quote.getAttribute('data-dc-confidence'), firstBand,
+                'repainting must not manufacture high confidence');
+        });
+    } finally {
+        setTestContext({ chat: [], chatMetadata: {} });
+    }
+});
+
+test('use automatic attribution stops the painter from reusing the removed override', () => {
+    const message = { id: 'm-1', mes: 'Alice said "Hello."', name: 'Alice' };
+    setTestContext({ chat: [message], chatMetadata: {} });
+    try {
+        withCharacters(['Alice', 'Bob'], () => {
+            const quote = fakeElement('Hello.');
+            const mesText = fakeElement('Hello.');
+            mesText.querySelectorAll = selector => selector === 'q' ? [quote] : [];
+            armSession();
+            streamingSession.mesElement = {
+                isConnected: true,
+                getAttribute: name => name === 'mesid' ? '0' : null,
+                querySelector: selector => selector === '.mes_text' ? mesText : null,
+            };
+            streamingSession.mesText = mesText;
+            assert.equal(setMessageQuoteOverride(0, message, 0, 'Bob'), true);
+            assert.equal(paintStreamingMessage(), true);
+            assert.equal(quote.getAttribute('data-dc-speaker'), 'bob');
+
+            assert.equal(deleteMessageQuoteOverride(0, message, 0), true);
+            assert.equal(paintStreamingMessage(), true);
+            assert.equal(quote.getAttribute('data-dc-speaker'), 'alice',
+                'removing the override must return the quote to the automatic speaker');
+        });
     } finally {
         setTestContext({ chat: [], chatMetadata: {} });
     }

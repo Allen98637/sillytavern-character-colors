@@ -8,6 +8,7 @@
     --dc-surface-soft: color-mix(in srgb, var(--SmartThemeBlurTintColor, rgba(20, 24, 28, 0.72)) 75%, transparent);
     --dc-danger: #c25555;
     --dc-danger-soft: rgba(194, 85, 85, 0.14);
+    --dc-danger-surface: color-mix(in srgb, #c25555 14%, rgb(from var(--SmartThemeBlurTintColor, #202328) r g b / 1));
     --dc-keep: #d9ba5a;
     --dc-keep-soft: rgba(217, 186, 90, 0.16);
     --dc-track: color-mix(in srgb, var(--dc-accent) 22%, transparent);
@@ -181,8 +182,8 @@ body.dc-fullscreen-open {
 }
 
 #dc-ext .dc-page-tab[data-dc-tab="danger"][aria-selected="true"] {
-    background: var(--dc-danger-soft);
-    color: var(--dc-danger);
+    background: Canvas;
+    color: CanvasText;
 }
 
 #dc-ext.dc-fullscreen > .dc-panel-content > [data-dc-page] {
@@ -459,8 +460,9 @@ body.dc-mark-uncertain [data-dc-colored][data-dc-confidence="low"] {
 }
 
 #dc-ext label.checkbox_label input[type="checkbox"] {
-    -webkit-appearance: none !important;
-    appearance: none !important;
+    -webkit-appearance: auto !important;
+    appearance: auto !important;
+    accent-color: auto;
     display: inline-block !important;
     position: relative !important;
     width: 16px !important;
@@ -470,9 +472,6 @@ body.dc-mark-uncertain [data-dc-colored][data-dc-confidence="low"] {
     max-width: 16px !important;
     max-height: 16px !important;
     flex: 0 0 auto !important;
-    border: 2px solid color-mix(in srgb, currentColor 48%, transparent) !important;
-    border-radius: 4px !important;
-    background: color-mix(in srgb, currentColor 6%, transparent) !important;
     cursor: pointer !important;
     margin: 0 !important;
     padding: 0 !important;
@@ -480,24 +479,11 @@ body.dc-mark-uncertain [data-dc-colored][data-dc-confidence="low"] {
     outline: none !important;
     box-sizing: border-box !important;
     vertical-align: middle !important;
-    transition: background 0.15s ease, border-color 0.15s ease !important;
 }
 
-#dc-ext label.checkbox_label input[type="checkbox"]::before {
-    content: none !important;
-}
-
+#dc-ext label.checkbox_label input[type="checkbox"]::before,
 #dc-ext label.checkbox_label input[type="checkbox"]::after {
-    content: '' !important;
-    position: absolute !important;
-    top: 50% !important;
-    left: 50% !important;
-    width: 6px !important;
-    height: 3px !important;
-    border-left: 2px solid transparent !important;
-    border-bottom: 2px solid transparent !important;
-    transform: translate(-50%, -60%) rotate(-45deg) !important;
-    transition: border-color 0.15s ease !important;
+    content: none !important;
 }
 
 #dc-ext label.checkbox_label input[type="checkbox"]:focus-visible {
@@ -505,14 +491,34 @@ body.dc-mark-uncertain [data-dc-colored][data-dc-confidence="low"] {
     outline-offset: 1px !important;
 }
 
-#dc-ext label.checkbox_label input[type="checkbox"]:checked {
-    background: var(--dc-accent) !important;
-    border-color: var(--dc-accent) !important;
-}
+/* Firefox's native mark can miss 3:1 on a custom accent. Use an explicit
+   contrast colour where supported; otherwise retain the native colour pair. */
+@supports (color: contrast-color(red)) and (color: rgb(from red r g b)) {
+    #dc-ext label.checkbox_label input[type="checkbox"] {
+        --dc-checkbox-fill: rgb(from var(--dc-accent) r g b / 1);
+        -webkit-appearance: none !important;
+        appearance: none !important;
+        border: 2px solid color-mix(in srgb, currentColor 48%, transparent) !important;
+        border-radius: 4px !important;
+        background: color-mix(in srgb, currentColor 6%, transparent) !important;
+    }
 
-#dc-ext label.checkbox_label input[type="checkbox"]:checked::after {
-    border-left-color: var(--SmartThemeBodyColor, #f7f7f8) !important;
-    border-bottom-color: var(--SmartThemeBodyColor, #f7f7f8) !important;
+    #dc-ext label.checkbox_label input[type="checkbox"]:checked {
+        background: var(--dc-checkbox-fill) !important;
+        border-color: var(--dc-checkbox-fill) !important;
+    }
+
+    #dc-ext label.checkbox_label input[type="checkbox"]:checked::after {
+        content: '' !important;
+        position: absolute !important;
+        top: 50% !important;
+        left: 50% !important;
+        width: 6px !important;
+        height: 3px !important;
+        border-left: 2px solid contrast-color(var(--dc-checkbox-fill)) !important;
+        border-bottom: 2px solid contrast-color(var(--dc-checkbox-fill)) !important;
+        transform: translate(-50%, -60%) rotate(-45deg) !important;
+    }
 }
 
 #dc-ext .dc-section {
@@ -693,8 +699,19 @@ body.dc-mark-uncertain [data-dc-colored][data-dc-confidence="low"] {
 #dc-ext .dc-field-error {
     flex-basis: 100%;
     min-height: 1.2em;
-    color: var(--dc-danger);
+    background: Canvas;
+    color: CanvasText;
     font-size: 0.82em;
+}
+
+/* Keep the red surface, but let the browser choose readable text. Opaque RGB
+   prevents a translucent custom theme from changing the measured background. */
+@supports (color: contrast-color(red)) and (color: rgb(from red r g b)) {
+    #dc-ext .dc-field-error,
+    #dc-ext .dc-page-tab[data-dc-tab="danger"][aria-selected="true"] {
+        background: var(--dc-danger-surface);
+        color: contrast-color(var(--dc-danger-surface));
+    }
 }
 
 #dc-ext .dc-field-error:empty {

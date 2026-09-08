@@ -72,6 +72,7 @@ export function isHostSystemOrToolMessage(msg) {
 const STATUS_SET = new Set(ATTRIBUTION_REVIEW_STATUSES);
 const SOURCE_SET = new Set(ATTRIBUTION_SOURCES);
 const VERIFICATION_STATUS_SET = new Set(ATTRIBUTION_VERIFICATION_STATUSES);
+const reviewMessageIdentities = new WeakMap();
 const SOURCE_ALIASES = Object.freeze({
     ai: ATTRIBUTION_SOURCE.LLM,
     model: ATTRIBUTION_SOURCE.LLM,
@@ -194,7 +195,10 @@ export function normalizeAttributionEvidence(value) {
         if (!type) continue;
         const normalized = { type };
         const method = boundedString(item.method, 64);
-        const speaker = boundedString(item.speaker, 80);
+        // The registry accepts names up to 120 characters; truncating speaker
+        // identities to 80 would silently break attribution back to the
+        // message author. Fingerprints keep their own shorter bounds.
+        const speaker = boundedString(item.speaker, 120);
         const detail = boundedString(item.detail ?? item.reason, 160);
         if (method) normalized.method = method;
         if (speaker) normalized.speaker = speaker;
@@ -247,9 +251,14 @@ export function createAttributionReviewId(value, segmentFingerprint, proposedSpe
     };
     const messagePart = boundedString(input.messageFingerprint, 80);
     const segmentPart = boundedString(input.segmentFingerprint, 80);
-    const speakerPart = boundedString(input.proposedSpeaker ?? input.speaker, 80).toLowerCase();
+    const speakerPart = boundedString(input.proposedSpeaker ?? input.speaker, 120).toLowerCase();
     const sourcePart = normalizeAttributionSource(input.source ?? input.provenance?.source ?? input.provenance);
-    return `ar1_${stableHash([messagePart, segmentPart, speakerPart, sourcePart].join('\u0000'))}`;
+    // An index is not an identity: deleting a message can put identical text
+    // at the same index. ID-less messages use a session-local object token.
+    const instancePart = boundedString(input.messageId, 120) || boundedString(input.messageIdentity, 120);
+    const swipePart = boundedString(input.swipeId ?? '', 32);
+    const contextPart = boundedString(input.contextFingerprint, 80);
+    return `ar1_${stableHash([messagePart, segmentPart, speakerPart, sourcePart, instancePart, swipePart, contextPart].join('\u0000'))}`;
 }
 
 export const createReviewId = createAttributionReviewId;
@@ -263,10 +272,24 @@ function normalizeStoredReview(value, fallbackStatus, now) {
     if (!isPlainObject(value)) return null;
     const messageFingerprint = boundedString(value.messageFingerprint, 80);
     const segmentFingerprint = boundedString(value.segmentFingerprint, 80);
-    const proposedSpeaker = boundedString(value.proposedSpeaker ?? value.speaker, 80);
+    const proposedSpeaker = boundedString(value.proposedSpeaker ?? value.speaker, 120);
     if (!messageFingerprint || !segmentFingerprint || !proposedSpeaker) return null;
     const source = normalizeAttributionSource(value.source ?? value.provenance?.source ?? value.provenance);
-    const computedId = createAttributionReviewId({ messageFingerprint, segmentFingerprint, proposedSpeaker, source });
+    const messageId = boundedString(value.messageId, 120);
+    const messageIdentity = boundedString(value.messageIdentity, 120);
+    const contextFingerprint = boundedString(value.contextFingerprint, 80);
+    const swipeId = boundedString(value.swipeId ?? value.swipe_id, 32);
+    const messageIndex = normalizedIndex(value.messageIndex ?? value.mesIndex);
+    const computedId = createAttributionReviewId({
+        messageFingerprint,
+        segmentFingerprint,
+        proposedSpeaker,
+        source,
+        messageId,
+        messageIdentity,
+        contextFingerprint,
+        swipeId,
+    });
     const suppliedId = boundedString(value.id, 96);
     const createdAt = normalizedTimestamp(value.createdAt, now);
     const updatedAt = normalizedTimestamp(value.updatedAt, createdAt);
@@ -283,12 +306,10 @@ function normalizeStoredReview(value, fallbackStatus, now) {
         createdAt,
         updatedAt,
     };
-    const messageIndex = normalizedIndex(value.messageIndex ?? value.mesIndex);
     const segmentIndex = normalizedIndex(value.segmentIndex ?? value.index);
     const segmentStart = normalizedIndex(value.segmentStart ?? value.start);
     const segmentEnd = normalizedIndex(value.segmentEnd ?? value.end);
-    const currentSpeaker = boundedString(value.currentSpeaker, 80);
-    const messageId = boundedString(value.messageId, 120);
+    const currentSpeaker = boundedString(value.currentSpeaker, 120);
     const messageHash = boundedString(value.messageHash, 32);
     const reason = boundedString(value.reason ?? value.staleReason, 80);
     if (messageIndex !== null) review.messageIndex = messageIndex;
@@ -297,7 +318,10 @@ function normalizeStoredReview(value, fallbackStatus, now) {
     if (segmentEnd !== null) review.segmentEnd = segmentEnd;
     if (currentSpeaker) review.currentSpeaker = currentSpeaker;
     if (messageId) review.messageId = messageId;
+    if (messageIdentity) review.messageIdentity = messageIdentity;
+    if (contextFingerprint) review.contextFingerprint = contextFingerprint;
     if (messageHash) review.messageHash = messageHash;
+    if (swipeId) review.swipeId = swipeId;
     if (reason) review.reason = reason;
     if (status !== ATTRIBUTION_REVIEW_STATUS.PENDING) {
         review.decidedAt = normalizedTimestamp(value.decidedAt, updatedAt);
@@ -406,23 +430,38 @@ function prepareMutableStore(store, options = {}) {
 function reviewFromCandidate(candidate, now) {
     if (!isPlainObject(candidate)) return null;
     const message = candidate.message;
-    const segment = candidate.segment;
     const messageFingerprint = boundedString(candidate.messageFingerprint, 80)
         || (message !== undefined ? createMessageFingerprint(message) : '');
     const segmentFingerprint = boundedString(candidate.segmentFingerprint, 80)
-        || (segment !== undefined ? createSegmentFingerprint(segment, messageFingerprint) : '');
-    const proposedSpeaker = boundedString(candidate.proposedSpeaker ?? candidate.speaker ?? candidate.assignment?.name, 80);
+        || (candidate.segment !== undefined ? createSegmentFingerprint(candidate.segment, messageFingerprint) : '');
+    const proposedSpeaker = boundedString(candidate.proposedSpeaker ?? candidate.speaker ?? candidate.assignment?.name, 120);
     if (!messageFingerprint || !segmentFingerprint || !proposedSpeaker) return null;
     const source = normalizeAttributionSource(candidate.source ?? candidate.provenance?.source ?? candidate.provenance);
-    const id = createAttributionReviewId({ messageFingerprint, segmentFingerprint, proposedSpeaker, source });
     const messageIndex = normalizedIndex(candidate.messageIndex ?? candidate.mesIndex);
-    const segmentIndex = normalizedIndex(candidate.segmentIndex ?? segment?.index ?? candidate.index);
-    const segmentStart = normalizedIndex(candidate.segmentStart ?? segment?.start ?? candidate.start);
-    const segmentEnd = normalizedIndex(candidate.segmentEnd ?? segment?.end ?? candidate.end);
     const messageId = boundedString(candidate.messageId, 120) || messageIdFor(message);
+    let messageIdentity = boundedString(candidate.messageIdentity, 120);
+    if (!messageId && isPlainObject(message)) {
+        if (!reviewMessageIdentities.has(message)) reviewMessageIdentities.set(message, crypto.getRandomValues(new Uint32Array(4)).join('-'));
+        messageIdentity = reviewMessageIdentities.get(message);
+    }
+    const contextFingerprint = boundedString(candidate.contextFingerprint, 80);
+    const swipeId = boundedString(candidate.swipeId, 32) || swipeIdFor(message);
+    const id = createAttributionReviewId({
+        messageFingerprint,
+        segmentFingerprint,
+        proposedSpeaker,
+        source,
+        messageId,
+        messageIdentity,
+        contextFingerprint,
+        swipeId,
+    });
+    const segmentIndex = normalizedIndex(candidate.segmentIndex ?? candidate.segment?.index ?? candidate.index);
+    const segmentStart = normalizedIndex(candidate.segmentStart ?? candidate.segment?.start ?? candidate.start);
+    const segmentEnd = normalizedIndex(candidate.segmentEnd ?? candidate.segment?.end ?? candidate.end);
     const messageHash = boundedString(candidate.messageHash, 32)
         || (message !== undefined ? hashAttributionMessageText(message?.mes ?? message?.text ?? message) : '');
-    const currentSpeaker = boundedString(candidate.currentSpeaker ?? candidate.currentAssignment?.name, 80);
+    const currentSpeaker = boundedString(candidate.currentSpeaker ?? candidate.currentAssignment?.name, 120);
     const review = {
         id,
         status: ATTRIBUTION_REVIEW_STATUS.PENDING,
@@ -440,7 +479,10 @@ function reviewFromCandidate(candidate, now) {
     if (segmentStart !== null) review.segmentStart = segmentStart;
     if (segmentEnd !== null) review.segmentEnd = segmentEnd;
     if (messageId) review.messageId = messageId;
+    if (messageIdentity) review.messageIdentity = messageIdentity;
+    if (contextFingerprint) review.contextFingerprint = contextFingerprint;
     if (messageHash) review.messageHash = messageHash;
+    if (swipeId) review.swipeId = swipeId;
     if (currentSpeaker) review.currentSpeaker = currentSpeaker;
     const reason = boundedString(candidate.reason, 80);
     if (reason) review.reason = reason;
@@ -544,14 +586,15 @@ function messageIdFor(message) {
     return boundedString(message?.id, 120) || boundedString(message?.send_date, 120);
 }
 
+function swipeIdFor(message) {
+    return boundedString(message?.swipe_id, 32);
+}
+
 function findCurrentMessage(chat, review) {
-    const indexed = review.messageIndex !== undefined ? chat[review.messageIndex] : null;
-    if (indexed && (!review.messageId || messageIdFor(indexed) === review.messageId)) return indexed;
-    if (review.messageId) {
-        const byId = chat.find(message => messageIdFor(message) === review.messageId);
-        return byId || null;
-    }
-    return chat.find(message => createMessageFingerprint(message) === review.messageFingerprint) || null;
+    const matches = chat.filter(message => review.messageId
+        ? messageIdFor(message) === review.messageId
+        : review.messageIdentity && reviewMessageIdentities.get(message) === review.messageIdentity);
+    return matches.length === 1 ? matches[0] : null;
 }
 
 function findCurrentMessageIndex(chat, review, message = findCurrentMessage(chat, review)) {
@@ -577,6 +620,11 @@ function getStaleReason(review, chat, options) {
         text: text.slice(review.segmentStart, review.segmentEnd),
     }, messageFingerprint);
     return currentSegmentFingerprint === review.segmentFingerprint ? '' : 'segment-changed';
+}
+
+export function isAttributionReviewCurrent(review, chat) {
+    if (!review || !Array.isArray(chat) || getStaleReason(review, chat, {})) return false;
+    return swipeIdFor(findCurrentMessage(chat, review)) === (review.swipeId || '');
 }
 
 export function pruneAttributionReviews(store, options = {}) {
@@ -633,9 +681,9 @@ function boundOverrideSegmentMaps(entry) {
 }
 
 function speakerFromOverride(value) {
-    if (typeof value === 'string') return boundedString(value, 80);
+    if (typeof value === 'string') return boundedString(value, 120);
     if (!isPlainObject(value)) return '';
-    return boundedString(value.speaker ?? value.name ?? value.assignment?.name ?? value.value, 80);
+    return boundedString(value.speaker ?? value.name ?? value.assignment?.name ?? value.value, 120);
 }
 
 function seedFrozenAttributionSegments(entry, freezeSegments, targetSegmentKey) {
@@ -712,6 +760,7 @@ export function getAttributionOverrideVariantKey(entry) {
         boundedString(entry?.hash, 32),
         Number.isInteger(entry?.textLength) ? entry.textLength : '',
         Object.prototype.hasOwnProperty.call(entry || {}, 'swipeId') ? boundedString(entry.swipeId, 64) : '',
+        boundedString(entry?.segmentationKey, 256),
     ].join('\u0000'))}`;
 }
 
@@ -719,7 +768,7 @@ function cloneBoundedOverrideEntry(entry, includeVariants = false) {
     if (!isPlainObject(entry)) return null;
     const clone = {};
     for (const key of [
-        'hash', 'messageId', 'messageFingerprint', 'textLength', 'swipeId',
+        'hash', 'messageId', 'messageFingerprint', 'textLength', 'swipeId', 'segmentationKey',
         'verificationStatus', 'verifiedHash', 'verifiedAt', 'verifiedVersion',
     ]) {
         if (Object.prototype.hasOwnProperty.call(entry, key)) clone[key] = entry[key];
@@ -740,6 +789,7 @@ function cloneBoundedOverrideEntry(entry, includeVariants = false) {
 
 function overrideEntryMatchesIdentity(entry, identity) {
     if (!isPlainObject(entry) || !identity.expectedHash || entry.hash !== identity.expectedHash) return false;
+    if ((entry.segmentationKey ?? '') !== identity.segmentationKey) return false;
     if (isLegacyHashOverrideEntry(entry, identity.expectedHash, identity.textLength)) return true;
     const storedMessageId = boundedString(entry.messageId, 120);
     const storedFingerprint = storedOverrideMessageFingerprint(entry);
@@ -832,7 +882,7 @@ export function setAttributionOverrideRecord(overrideMap, review, options = {}) 
     if (!isPlainObject(overrideMap) || !isPlainObject(review)) return false;
     const messageIndex = normalizedIndex(review.messageIndex ?? options.messageIndex);
     const segmentIndex = normalizedIndex(review.segmentIndex ?? options.segmentIndex);
-    const speaker = boundedString(options.speaker ?? review.proposedSpeaker ?? review.speaker, 80);
+    const speaker = boundedString(options.speaker ?? review.proposedSpeaker ?? review.speaker, 120);
     if (messageIndex === null || segmentIndex === null || !speaker) return false;
     const message = options.message;
     const text = message === undefined ? '' : String(message?.mes ?? message?.text ?? message);
@@ -854,6 +904,7 @@ export function setAttributionOverrideRecord(overrideMap, review, options = {}) 
     const messageFingerprint = currentMessageFingerprint || reviewMessageFingerprint;
     const messageKey = String(messageIndex);
     const swipeId = messageSwipeIdFor(message);
+    const segmentationKey = boundedString(options.segmentationKey, 256);
     let entry = expectedHash
         ? activateAttributionOverrideEntry(overrideMap, messageKey, {
             expectedHash,
@@ -861,6 +912,7 @@ export function setAttributionOverrideRecord(overrideMap, review, options = {}) 
             messageFingerprint,
             textLength: message === undefined ? null : text.length,
             swipeId,
+            segmentationKey,
         })
         : cloneBoundedOverrideEntry(overrideMap[messageKey], true) || { segments: {} };
     overrideMap[messageKey] = entry;
@@ -868,6 +920,7 @@ export function setAttributionOverrideRecord(overrideMap, review, options = {}) 
     if (messageId) entry.messageId = messageId;
     else delete entry.messageId;
     if (messageFingerprint) entry.messageFingerprint = messageFingerprint;
+    if (segmentationKey) entry.segmentationKey = segmentationKey;
     if (message !== undefined) entry.textLength = text.length;
     if (message !== undefined) {
         if (swipeId === null) delete entry.swipeId;
@@ -1068,11 +1121,16 @@ export function createAttributionStore(value = {}, chat) {
             const message = currentChat ? findCurrentMessage(currentChat, pending) : undefined;
             const currentMessageIndex = currentChat ? findCurrentMessageIndex(currentChat, pending, message) : null;
             if (currentChat && (currentMessageIndex === null || !message)) return null;
+            // A review belongs to the swipe that produced it. Accepting it onto
+            // another swipe of the same message would silently rewrite that
+            // swipe's attribution.
+            const currentSwipeId = swipeIdFor(message);
+            if ((pending.swipeId || '') !== currentSwipeId) return null;
             const candidate = {
                 ...pending,
                 ...(currentMessageIndex === null ? {} : { messageIndex: currentMessageIndex }),
             };
-            let acceptedSpeaker = boundedString(operationOptions.speaker ?? candidate.proposedSpeaker, 80);
+            let acceptedSpeaker = boundedString(operationOptions.speaker ?? candidate.proposedSpeaker, 120);
             if (typeof options.validateAcceptance === 'function') {
                 let validation;
                 try {
@@ -1081,7 +1139,7 @@ export function createAttributionStore(value = {}, chat) {
                     return null;
                 }
                 if (validation === false || validation === null || validation === undefined) return null;
-                if (typeof validation === 'string') acceptedSpeaker = boundedString(validation, 80);
+                if (typeof validation === 'string') acceptedSpeaker = boundedString(validation, 120);
             }
             if (!acceptedSpeaker) return null;
 
@@ -1151,6 +1209,8 @@ export function createAttributionStore(value = {}, chat) {
                 try {
                     applied = setAttributionOverrideRecord(overrideMap, candidate, {
                         message,
+                        segmentationKey: typeof options.getSegmentationKey === 'function'
+                            ? options.getSegmentationKey() : operationOptions.segmentationKey,
                         speaker: acceptedSpeaker,
                         source: overrideSource,
                         verificationStatus: operationOptions.verificationStatus ?? ATTRIBUTION_VERIFICATION_STATUS.CLEAN,

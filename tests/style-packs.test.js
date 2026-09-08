@@ -10,6 +10,7 @@ import {
     flattenStylePackAssignmentPresets,
     normalizeStylePack,
 } from '../src/style-packs.js';
+import { analyzeStylePackEnvelopeSource, normalizeStylePackEnvelope } from '../src/style-pack-adapter.js';
 
 function assignment(name, color, aliases = []) {
     return { name, color, aliases };
@@ -241,4 +242,54 @@ test('unresolved appearance palette references are rejected', () => {
         }),
         error => error instanceof StylePackError && error.code === 'unresolved_appearance_reference',
     );
+});
+
+test('dictionary names storage rejects are rejected before installation', () => {
+    for (const name of ['Blue {night}', '<angle>', 'trailing}']) {
+        assert.throws(
+            () => normalizeStylePack({
+                format: STYLE_PACK_FORMAT,
+                formatVersion: STYLE_PACK_FORMAT_VERSION,
+                metadata: { name: 'Invalid dictionary name' },
+                palettes: { [name]: ['#112233'] },
+            }),
+            error => error instanceof StylePackError && error.code === 'invalid_name',
+            `palette "${name}" must not survive storage identity normalisation`,
+        );
+    }
+    assert.throws(
+        () => normalizeStylePack({
+            format: STYLE_PACK_FORMAT,
+            formatVersion: STYLE_PACK_FORMAT_VERSION,
+            metadata: { name: 'Invalid preset name' },
+            gradientPresets: { 'fade}in': { gradient: { stops: ['#112233', '#445566'] } } },
+        }),
+        error => error instanceof StylePackError && error.code === 'invalid_name',
+    );
+});
+
+test('palette names that shadow object built-ins survive envelope analysis', async () => {
+    for (const name of ['toString', 'valueOf', 'hasOwnProperty']) {
+        const pack = {
+            format: STYLE_PACK_FORMAT,
+            formatVersion: STYLE_PACK_FORMAT_VERSION,
+            metadata: { name: 'Shadowed names' },
+            palettes: { [name]: ['#111111', '#222222'] },
+        };
+        const normalized = normalizeStylePackEnvelope(pack);
+        assert.deepEqual(normalized.pack.palettes, { [name]: ['#111111', '#222222'] });
+        const analysis = await analyzeStylePackEnvelopeSource(JSON.stringify(pack));
+        assert.equal(analysis.ok, true, `palette "${name}" must analyse without inheriting prototype metadata`);
+        assert.deepEqual(analysis.pack.palettes, { [name]: ['#111111', '#222222'] });
+    }
+});
+
+test('palette metadata follows the same name normalisation as its colours', () => {
+    const normalized = normalizeStylePackEnvelope({
+        format: STYLE_PACK_FORMAT,
+        formatVersion: STYLE_PACK_FORMAT_VERSION,
+        metadata: { name: 'Normalised names' },
+        palettes: { 'Blu\u0000e': { colors: ['#112233'], metadata: { notes: 'Retain this note' } } },
+    });
+    assert.equal(normalized.pack.palettes.Blue.metadata.notes, 'Retain this note');
 });

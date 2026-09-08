@@ -18,7 +18,7 @@ import { applyGradientPreset, applyThemeReadabilityAndBrightness, buildCharacter
 import { injectPrompt, updateSystemPromptDisplay } from './prompts.js';
 import { escapeHtml, eventSource, event_types, getContext } from './st-api.js';
 import { autoRecolorHintShown, characterColors, expandedCharacterRows, groupProfiles, isDomEngine, searchTerm, selectedCharacterKeys, setAutoRecolorHintShown, setCharacterColors, setGroupProfiles, setSearchTerm, setSwapMode, settings, swapMode, synchronizeEnabledLifecycle } from './state.js';
-import { analyzeColorImport, analyzeSettingsImport, analyzeStylePackImport, applyCardData, applyColorImport, applySettingsImport, applyStylePackImport, archiveStoredColorData, deleteCustomGradientPreset, disableAutoSync, enableAutoSync, exportColors, exportSettings, getArchivedColorData, getCurrentStorageScope, getCustomGradientPresets, getLegendPosition, getPinnedPersonaColors, getStorageKey, getStorageKeyForScope, getStorageLabelForKey, getStorageScopeDescriptor, getStylePackRegistry, getUserColorDataStore, markCardCharactersKept, markCurrentPersonaKept, normalizeColorDataEntry, normalizeToggleSettings, readCardData, removePinnedCharacterKey, renameCustomGradientPreset, renamePinnedPersonaColor, restoreAllSettingsToDefaults, restoreArchivedColorData, restorePinnedPersonaColor, saveCustomGradientPreset, saveData, saveLegendPosition, saveToCard, switchColorStorageScope, syncPinnedPersonaColors, updateAutoSyncUI } from './storage.js';
+import { analyzeColorImport, analyzeSettingsImport, analyzeStylePackImport, applyCardData, applyColorImport, applySettingsImport, applyStylePackImport, archiveStoredColorData, deleteCustomGradientPreset, disableAutoSync, enableAutoSync, exportColors, exportSettings, getArchivedColorData, getCurrentStorageScope, getCustomGradientPresets, getLegendPosition, getPinnedPersonaColors, getStorageKey, getStorageKeyForScope, getStorageLabelForKey, getStorageScopeDescriptor, getStoredColorDataFingerprint, getStylePackRegistry, getUserColorDataStore, markCardCharactersKept, markCurrentPersonaKept, normalizeColorDataEntry, normalizeToggleSettings, readCardData, removePinnedCharacterKey, renameCustomGradientPreset, renamePinnedPersonaColor, restoreAllSettingsToDefaults, restoreArchivedColorData, restorePinnedPersonaColor, saveCustomGradientPreset, saveData, saveLegendPosition, saveToCard, switchColorStorageScope, syncPinnedPersonaColors, updateAutoSyncUI } from './storage.js';
 import { buildStylePackEnvelope } from './style-pack-adapter.js';
 import { escapeAttr, getGoogleFontFamily, htmlToNode, normalizeEntryGradientGenerator, normalizeGoogleFontName, normalizeHexColor, normalizeManualColorInput, toast } from './utils.js';
 import { AUTO_HIGH_ATTRIBUTION_CONFIDENCE, cancelStreamingAttributionVerification, clearAutoAttributionVerificationQueue, getAttributionVerifyPasses, queueAutoAttributionVerificationForRenderedMessages, runAttributionVerification, verifyLatestAttributionsWithLLM, verifyVisibleAttributionsWithLLM } from './verify.js';
@@ -66,10 +66,13 @@ const expandedGradientAdvancedRows = new Set();
 let lastLegendSignature = '';
 let closeActiveUiDialog = null;
 let copiedGradientGenerator = null;
+let copiedGradientFieldIncluded = false;
 let selectedGradientGalleryPreset = '';
 let gradientGallerySearch = '';
 let gradientGalleryFilter = 'all';
 let gradientGalleryMotionActive = false;
+let gradientGalleryTarget = 'selected';
+let lastRenderedTableKey = null;
 let lastColorVisionPreviewSignature = '';
 const STYLE_PACK_COPY_LIMIT = 100 * 1024;
 const STYLE_PACK_FILE_LIMIT = 1024 * 1024;
@@ -110,7 +113,7 @@ function isUiChatBindingCurrent(binding) {
 
 function notifyUiContextChanged(message = 'The active chat, card, or color table changed. Review the action again.') {
     const result = { ok: false, error: 'context_changed', message };
-    toast.info(message);
+    toast.warning(message);
     return result;
 }
 
@@ -179,7 +182,7 @@ function openDecisionDialog({ title, description = '', detailsHtml = '', choices
                 ${input ? `<label class="dc-dialog-input" for="${inputId}"><span>${escapeHtml(input.label)}</span><input id="${inputId}" class="text_pole dc-dialog-text-input" type="text" value="${escapeAttr(input.value || '')}"${inputListId ? ` list="${inputListId}"` : ''} autocomplete="off">${input.help ? `<small>${escapeHtml(input.help)}</small>` : ''}</label>${inputListId ? `<datalist id="${inputListId}">${input.options.map(option => `<option value="${escapeAttr(option)}"></option>`).join('')}</datalist>` : ''}` : ''}
                 ${formHtml}
                 <div class="dc-dialog-actions">
-                    ${choices.map(choice => `<button type="button" class="menu_button${choice.primary ? ' dc-primary-button' : ''}${choice.danger ? ' dc-danger-button' : ''}" data-dialog-value="${escapeAttr(choice.value)}"${choice.initial ? ' data-dialog-initial="true"' : ''}${choice.disabled ? ' disabled' : ''}>${escapeHtml(choice.label)}</button>`).join('')}
+                    ${choices.map(choice => `<button type="button" class="menu_button${choice.primary ? ' dc-primary-button' : ''}${choice.danger ? ' dc-danger-button' : ''}" data-dialog-value="${escapeAttr(choice.value)}"${choice.validate ? ' data-dialog-validate="true"' : ''}${choice.initial ? ' data-dialog-initial="true"' : ''}${choice.disabled ? ' disabled' : ''}>${escapeHtml(choice.label)}</button>`).join('')}
                 </div>
             </div>`;
         (document.body || document.documentElement).appendChild(backdrop);
@@ -225,7 +228,14 @@ function openDecisionDialog({ title, description = '', detailsHtml = '', choices
         document.addEventListener('keydown', onKeyDown, true);
         backdrop.addEventListener('pointerdown', event => { if (event.target === backdrop) close(null); });
         dialog.querySelectorAll('[data-dialog-value]').forEach(button => {
-            button.addEventListener('click', () => close(button.dataset.dialogValue));
+            button.addEventListener('click', () => {
+                if (button.dataset.dialogValidate === 'true') {
+                    for (const field of dialog.querySelectorAll('[data-dialog-field]')) {
+                        if (!field.reportValidity()) return;
+                    }
+                }
+                close(button.dataset.dialogValue);
+            });
         });
         (dialog.querySelector('[data-dialog-autofocus]') || dialog.querySelector('.dc-dialog-text-input') || dialog.querySelector('[data-dialog-initial]') || dialog.querySelector('.dc-primary-button') || getDialogFocusables(dialog)[0])?.focus({ preventScroll: true });
     });
@@ -247,7 +257,7 @@ async function confirmReviewedAction({ title, description, detailsHtml = '', con
                 { value: 'cancel', label: 'Cancel' },
             ],
     });
-    return decision.value === 'confirm';
+    return decision.value == null ? null : decision.value === 'confirm';
 }
 
 function formatScopeName(scope) {
@@ -781,7 +791,7 @@ export function createLegend() {
 
 export function updateLegend() {
     const legend = createLegend();
-    const visible = !!settings.enabled && !!settings.showLegend;
+    const visible = !!settings.enabled && !!settings.showLegend && !isSettingsFullscreen();
     const allEntries = Object.entries(characterColors);
     const entries = allEntries.slice(0, FLOATING_LEGEND_RENDER_LIMIT);
     const omittedEntryCount = allEntries.length - entries.length;
@@ -914,7 +924,7 @@ export async function showStorageManager() {
         const identity = names.length ? names.join(', ') + (colorCount > 3 ? ` (+${colorCount - 3})` : '') : getStorageLabelForKey(k);
         const label = `${scope}: ${identity}`;
         const sizeStr = size < 1024 ? `${size} B` : `${(size / 1024).toFixed(1)} KB`;
-        return { key: k, label, colorCount, groupProfileCount, sizeStr, size, isCurrent, updatedAt: entry.updatedAt || '' };
+        return { key: k, label, colorCount, groupProfileCount, sizeStr, size, isCurrent, updatedAt: entry.updatedAt || '', fingerprint: getStoredColorDataFingerprint(k) };
     });
     entries.sort((a, b) => a.isCurrent ? -1 : b.isCurrent ? 1 : a.key.localeCompare(b.key));
 
@@ -952,8 +962,13 @@ export async function showStorageManager() {
         danger: true,
     });
     if (!confirmed) return;
-    const result = await archiveStoredColorData(selected);
+    const reviewedFingerprints = {};
+    for (const entry of entries) {
+        if (selected.includes(entry.key)) reviewedFingerprints[entry.key] = entry.fingerprint;
+    }
+    const result = await archiveStoredColorData(selected, reviewedFingerprints);
     if (result.ok) toast.success(`Archived ${result.count} stored color table${result.count === 1 ? '' : 's'}.`);
+    else if (result.error === 'context_changed') toast.error('The selected tables changed after review. Review them again before archiving.');
     else if (result.rollbackPersisted === false) toast.error('Archive failed, and its recovery could not be saved reliably. Export your colors before reloading.');
     else toast.error('The selected tables could not be archived safely.');
 }
@@ -1154,6 +1169,9 @@ function buildAttributionReviewDetails(presentation) {
 }
 
 function jumpToAttributionReviewMessage(presentation) {
+    // Fullscreen covers the chat and marks it non-interactive; exit first so
+    // the jumped message can actually be revealed and focused.
+    if (isSettingsFullscreen()) exitSettingsFullscreen();
     if (!Number.isInteger(presentation.messageIndex) || presentation.messageIndex < 0) {
         toast.info('This message is no longer available.');
         return;
@@ -1185,6 +1203,7 @@ function jumpToAttributionReviewMessage(presentation) {
 }
 
 async function repaintAcceptedAttributionReview(decision) {
+    const reviewScope = captureAttributionReviewScope();
     const messageIndex = Number(decision?.messageIndex);
     const message = Number.isInteger(messageIndex) ? getContext()?.chat?.[messageIndex] : null;
     if (!message) return false;
@@ -1195,12 +1214,14 @@ async function repaintAcceptedAttributionReview(decision) {
         queueVerification: false,
         renderFallback: false,
     });
+    if (!isAttributionReviewScopeCurrent(reviewScope)) return false;
     if (!repainted) repainted = await refreshAndDecorateMessageDom(messageIndex, message, { queueVerification: false });
-    if (repainted) scheduleMessageDomFollowupRepair(messageIndex, repainted);
+    if (repainted && isAttributionReviewScopeCurrent(reviewScope)) scheduleMessageDomFollowupRepair(messageIndex, repainted);
     return repainted;
 }
 
 async function editAndAcceptAttributionReview(review, opener) {
+    const reviewScope = captureAttributionReviewScope();
     const options = getKnownReviewSpeakerOptions();
     let editedName = review.proposedSpeaker;
     while (true) {
@@ -1220,12 +1241,30 @@ async function editAndAcceptAttributionReview(review, opener) {
                 { value: 'cancel', label: 'Cancel' },
             ],
         });
+        if (!isAttributionReviewScopeCurrent(reviewScope)) {
+            notifyUiContextChanged('The chat changed; the suggestion was not applied.');
+            return null;
+        }
+        // Dismissal or supersession stops the parent review as well.
+        if (decision.value == null) return null;
         if (decision.value !== 'accept') return '';
         editedName = decision.inputValue;
         const canonicalName = getKnownReviewSpeakerName(editedName);
         if (canonicalName) return canonicalName;
         toast.warning('Choose a known canonical speaker or alias. Direct manual assignment is available from the dialogue context menu.');
     }
+}
+
+// Review IDs belong to one chat's metadata, not the currently visible chat.
+function captureAttributionReviewScope() {
+    const context = getContext();
+    return { chat: context?.chat ?? null, chatMetadata: context?.chatMetadata ?? context?.chat_metadata ?? null };
+}
+
+function isAttributionReviewScopeCurrent(scope) {
+    const context = getContext();
+    return (context?.chat ?? null) === scope.chat
+        && (context?.chatMetadata ?? context?.chat_metadata ?? null) === scope.chatMetadata;
 }
 
 async function acceptAttributionReviewFromUi(presentation, speakerName = '', options = {}) {
@@ -1251,6 +1290,7 @@ async function acceptAttributionReviewFromUi(presentation, speakerName = '', opt
 }
 
 async function acceptAllHighConfidenceAttributionReviews(opener) {
+    const reviewScope = captureAttributionReviewScope();
     const candidates = getPendingAttributionReviews()
         .map(getAttributionReviewPresentation)
         .filter(presentation => !presentation.stale
@@ -1267,9 +1307,18 @@ async function acceptAllHighConfidenceAttributionReviews(opener) {
         confirmLabel: 'Accept high-confidence',
         opener,
     });
-    if (!confirmed) return 0;
+    if (!confirmed) return confirmed === null ? null : 0;
+    if (!isAttributionReviewScopeCurrent(reviewScope)) {
+        notifyUiContextChanged('The chat changed; suggestions were not applied.');
+        return 0;
+    }
     let accepted = 0;
     for (const presentation of candidates) {
+        if (closeActiveUiDialog) return null;
+        if (!isAttributionReviewScopeCurrent(reviewScope)) {
+            notifyUiContextChanged('The chat changed; remaining suggestions were not applied.');
+            break;
+        }
         if (await acceptAttributionReviewFromUi(presentation, '', { quiet: true })) accepted++;
     }
     if (accepted > 1) toast.success(`Accepted ${accepted} high-confidence suggestions.`);
@@ -1277,6 +1326,7 @@ async function acceptAllHighConfidenceAttributionReviews(opener) {
 }
 
 async function acceptAllProposedAttributionReviews(opener) {
+    const reviewScope = captureAttributionReviewScope();
     const candidates = getPendingAttributionReviews()
         .map(getAttributionReviewPresentation)
         .filter(presentation => !presentation.stale
@@ -1292,9 +1342,18 @@ async function acceptAllProposedAttributionReviews(opener) {
         confirmLabel: 'Accept all proposed',
         opener,
     });
-    if (!confirmed) return 0;
+    if (!confirmed) return confirmed === null ? null : 0;
+    if (!isAttributionReviewScopeCurrent(reviewScope)) {
+        notifyUiContextChanged('The chat changed; suggestions were not applied.');
+        return 0;
+    }
     let accepted = 0;
     for (const presentation of candidates) {
+        if (closeActiveUiDialog) return null;
+        if (!isAttributionReviewScopeCurrent(reviewScope)) {
+            notifyUiContextChanged('The chat changed; remaining suggestions were not applied.');
+            break;
+        }
         if (await acceptAttributionReviewFromUi(presentation, '', { quiet: true })) accepted++;
     }
     if (accepted > 0) toast.success(`Accepted ${accepted} proposed suggestion${accepted !== 1 ? 's' : ''}.`);
@@ -1303,7 +1362,13 @@ async function acceptAllProposedAttributionReviews(opener) {
 
 async function showAttributionReviewDialog(opener) {
     let nextReviewId = '';
+    const reviewScope = captureAttributionReviewScope();
     while (true) {
+        if (!isAttributionReviewScopeCurrent(reviewScope)) {
+            notifyUiContextChanged('The chat changed; remaining suggestions were not applied.');
+            break;
+        }
+        if (closeActiveUiDialog) break;
         const reviews = getPendingAttributionReviews();
         if (!reviews.length) {
             await openDecisionDialog({
@@ -1340,6 +1405,10 @@ async function showAttributionReviewDialog(opener) {
             ],
         });
         if (!decision.value || decision.value === 'close') break;
+        if (!isAttributionReviewScopeCurrent(reviewScope)) {
+            notifyUiContextChanged('The chat changed; the reviewed action was not applied.');
+            break;
+        }
         if (decision.value === 'jump') {
             jumpToAttributionReviewMessage(presentation);
             break;
@@ -1349,17 +1418,20 @@ async function showAttributionReviewDialog(opener) {
             continue;
         }
         if (decision.value === 'accept-all') {
-            await acceptAllProposedAttributionReviews(opener);
+            if (await acceptAllProposedAttributionReviews(opener) === null) break;
             nextReviewId = reviews[reviewIndex + 1]?.id || '';
             continue;
         }
         if (decision.value === 'accept-high') {
-            await acceptAllHighConfidenceAttributionReviews(opener);
+            if (await acceptAllHighConfidenceAttributionReviews(opener) === null) break;
             nextReviewId = reviews[reviewIndex + 1]?.id || '';
             continue;
         }
         if (decision.value === 'edit') {
             const editedSpeaker = await editAndAcceptAttributionReview(review, opener);
+            // A superseded editor must stop this review flow: continuing would
+            // open another attribution dialog and cancel the newer flow.
+            if (editedSpeaker === null || !isAttributionReviewScopeCurrent(reviewScope)) break;
             if (editedSpeaker) await acceptAttributionReviewFromUi(presentation, editedSpeaker);
         } else if (decision.value === 'accept') {
             await acceptAttributionReviewFromUi(presentation);
@@ -1405,9 +1477,8 @@ export function addCharacter(name, color, options = {}) {
         toast.info('Use the dedicated Narration editor instead of adding Narrator as a character.');
         return;
     }
-    // Names with [COLORS:] block delimiters or control characters cannot
-    // round-trip through ingest and would corrupt the prompt block.
-    if (/[\r\n\t\[\]=,()]/.test(name.trim())) {
+    // Normalisation can turn full-width punctuation into prompt delimiters.
+    if (/[\r\n\t\[\]=,()]/.test(name.trim().normalize('NFKC'))) {
         toast.error('Character names cannot contain brackets, commas, equals signs, parentheses, or line breaks.');
         return;
     }
@@ -1879,7 +1950,8 @@ function handleMoreClick(moreBtn) {
 
 function focusCharacterControl(key, focusId) {
     requestAnimationFrame(() => {
-        document.querySelector(`.dc-char[data-key="${CSS.escape(key)}"] [data-focus-id="${CSS.escape(focusId)}"]`)?.focus({ preventScroll: true });
+        const row = document.querySelector(`.dc-char[data-key="${CSS.escape(key)}"]`);
+        (row?.querySelector(`[data-focus-id="${CSS.escape(focusId)}"]`) || row?.querySelector('.dc-more'))?.focus({ preventScroll: true });
     });
 }
 
@@ -2004,7 +2076,14 @@ function handleAliasClick(aliasBtn) {
     };
     inputRow.querySelector('.dc-inline-submit').onclick = submit;
     inputRow.querySelector('.dc-inline-cancel').onclick = close;
-    inp.onkeydown = ev => { if (ev.key === 'Enter') submit(); if (ev.key === 'Escape') close(); };
+    inp.onkeydown = ev => {
+        if (ev.key === 'Enter') submit();
+        if (ev.key === 'Escape') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            close();
+        }
+    };
 }
 
 function handleRenameClick(renameBtn) {
@@ -2036,7 +2115,14 @@ function handleRenameClick(renameBtn) {
     };
     inputRow.querySelector('.dc-inline-submit').onclick = submit;
     inputRow.querySelector('.dc-inline-cancel').onclick = close;
-    inp.onkeydown = ev => { if (ev.key === 'Enter') submit(); if (ev.key === 'Escape') close(); };
+    inp.onkeydown = ev => {
+        if (ev.key === 'Enter') submit();
+        if (ev.key === 'Escape') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            close();
+        }
+    };
 }
 
 function readValidatedGroupInput(input) {
@@ -2083,7 +2169,14 @@ function handleFontClick(fontBtn) {
     };
     inputRow.querySelector('.dc-inline-submit').onclick = submit;
     inputRow.querySelector('.dc-inline-cancel').onclick = close;
-    inp.onkeydown = ev => { if (ev.key === 'Enter') submit(); if (ev.key === 'Escape') close(); };
+    inp.onkeydown = ev => {
+        if (ev.key === 'Enter') submit();
+        if (ev.key === 'Escape') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            close();
+        }
+    };
 }
 
 function handleGroupClick(groupBtn) {
@@ -2115,7 +2208,14 @@ function handleGroupClick(groupBtn) {
     };
     inputRow.querySelector('.dc-inline-submit').onclick = submit;
     inputRow.querySelector('.dc-inline-cancel').onclick = close;
-    inp.onkeydown = ev => { if (ev.key === 'Enter') submit(); if (ev.key === 'Escape') close(); };
+    inp.onkeydown = ev => {
+        if (ev.key === 'Enter') submit();
+        if (ev.key === 'Escape') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            close();
+        }
+    };
 }
 
 function getGradientEditorContext(control) {
@@ -2193,7 +2293,12 @@ function synchronizeGradientEditorFromEntry(editor, entry) {
     const directionSelect = editor.querySelector('.dc-gradient-direction');
     if (directionSelect) {
         const isFriendlyDirection = GRADIENT_DIRECTIONS.some(direction => direction.value === gradient.angle);
-        const customOption = [...directionSelect.options].find(option => option.value === '');
+        let customOption = [...directionSelect.options].find(option => option.value === '');
+        if (!customOption && !isFriendlyDirection) {
+            customOption = document.createElement('option');
+            customOption.value = '';
+            directionSelect.appendChild(customOption);
+        }
         if (customOption) customOption.textContent = `Custom (${Number(gradient.angle.toFixed(1))}°)`;
         directionSelect.value = isFriendlyDirection ? String(gradient.angle) : '';
     }
@@ -2461,6 +2566,11 @@ function renderNarratorEditor() {
     const host = document.getElementById('dc-narrator-editor');
     if (!host) return;
     const scrollPositions = captureScrollPositions(host);
+    const focusedElement = host.contains(document.activeElement) ? document.activeElement : null;
+    const focusedId = focusedElement?.id || null;
+    const focusedStop = focusedElement && focusedElement.dataset?.stopIndex !== undefined
+        ? { className: String(focusedElement.className || ''), stopIndex: focusedElement.dataset.stopIndex }
+        : null;
     const style = normalizeNarratorStyle(settings.narratorStyle, { legacy: settings });
     const visual = getNarratorPreviewVisual(style);
     const gradient = normalizeGradient(style.gradient);
@@ -2494,6 +2604,10 @@ function renderNarratorEditor() {
     host.dataset.narratorSignature = JSON.stringify(style);
     bindNarratorEditorControls(host);
     restoreScrollPositions(scrollPositions);
+    // The rebuild replaced every control's DOM; restore keyboard focus to the
+    // equivalent control so Space/arrow editing is not interrupted.
+    if (focusedId) host.querySelector(`#${focusedId}`)?.focus?.();
+    else if (focusedStop) host.querySelector(`.${focusedStop.className.trim().split(/\s+/).join('.')}[data-stop-index="${focusedStop.stopIndex}"]`)?.focus?.();
     requestAnimationFrame(() => restoreScrollPositions(scrollPositions));
 }
 
@@ -2695,6 +2809,18 @@ export function renderGradientPresetGallery(preferredPreset = '', focusId = '') 
         ${selected.source === 'custom' ? `<div class="dc-gradient-gallery-custom"><label class="dc-visually-hidden" for="dc-gradient-gallery-rename">New custom preset name</label><input type="text" id="dc-gradient-gallery-rename" class="text_pole" maxlength="80" value="${escapeAttr(selected.name)}"><button type="button" id="dc-gradient-gallery-rename-button" class="menu_button" data-gallery-focus="rename">Rename</button><button type="button" id="dc-gradient-gallery-delete" class="menu_button dc-danger-button" data-gallery-focus="delete">Delete</button></div>` : ''}` : '<p class="dc-empty-state">No gradient presets available.</p>'}`;
 
     const searchInput = host.querySelector('#dc-gradient-gallery-search');
+    const targetSelect = host.querySelector('#dc-gradient-gallery-target');
+    if (targetSelect) {
+        // Keep the chosen Apply target across rebuilds: searching, filtering or
+        // picking a preset must not silently switch the apply back to the
+        // Selected rows and recolor someone else.
+        if ([...targetSelect.options].some(option => option.value === gradientGalleryTarget)) {
+            targetSelect.value = gradientGalleryTarget;
+        } else {
+            gradientGalleryTarget = 'selected';
+        }
+        targetSelect.addEventListener('change', event => { gradientGalleryTarget = event.target.value; });
+    }
     searchInput?.addEventListener('input', event => {
         gradientGallerySearch = event.target.value;
         renderGradientPresetGallery('', 'search');
@@ -2966,6 +3092,10 @@ export function installCharListDelegation(list) {
         if (!t.classList) return;
         if (t.classList.contains('dc-char-select')) {
             setCharacterSelected(t.dataset.key, t.checked);
+            // The visible checked state changed outside updateCharList; a stale
+            // reuse signature would make the next refresh skip rebuilding and
+            // leave the row mismatched with the toolbar count.
+            t.closest('.dc-char')?.removeAttribute('data-dc-sig');
             t.closest('.dc-char')?.classList.toggle('dc-char-selected', t.checked);
             updateBulkToolbar(getVisibleCharacterEntries());
         } else if (t.classList.contains('dc-gradient-type')) {
@@ -3000,7 +3130,9 @@ export function installCharListDelegation(list) {
         const t = e.target;
         if (t.classList && t.classList.contains('dc-color-hex') && e.key === 'Enter') {
             e.preventDefault();
-            if (applyHexInputForElement(t, { saveImmediately: true })) maybeAutoRecolorAfterColorChange();
+            // Let the change handler perform the single commit: committing here
+            // AND then blurring would fire 'change' and push a second, identical
+            // history snapshot (the first Undo would look dead).
             t.blur();
         } else if (t.classList?.contains('dc-gradient-preset-name') && e.key === 'Enter') {
             e.preventDefault();
@@ -3067,7 +3199,6 @@ function syncGroupProfileEditor() {
     if (source) source.value = '';
     const renameInput = document.getElementById('dc-group-profile-rename');
     if (renameInput) renameInput.value = '';
-    refreshGroupProfileControls();
 }
 
 export function refreshGroupProfileControls() {
@@ -3114,6 +3245,11 @@ export function refreshGroupProfileControls() {
 
     const name = getGroupProfileEditorName();
     const profile = getGroupProfile(groupProfiles, name);
+    const signature = JSON.stringify([getStorageKeyForScope(getCurrentStorageScope(), { persistMetadata: false }), name, profile ?? null]);
+    if (nameInput.dataset.profileSignature !== signature) {
+        nameInput.dataset.profileSignature = signature;
+        syncGroupProfileEditor();
+    }
     const targetCount = getCharacterKeysForGroup(name).length;
     const status = document.getElementById('dc-group-profile-status');
     const saveButton = document.getElementById('dc-group-profile-save');
@@ -3169,7 +3305,7 @@ function renameGroupProfileFromEditor() {
     saveHistory();
     saveData();
     document.getElementById('dc-group-profile-name').value = nextName;
-    syncGroupProfileEditor();
+    refreshGroupProfileControls();
     toast.success(`Group profile renamed to "${escapeHtml(nextName)}".`);
 }
 
@@ -3194,7 +3330,7 @@ async function deleteGroupProfileFromEditor(opener) {
     setGroupProfiles(deleteGroupProfile(groupProfiles, name));
     saveHistory();
     saveData();
-    syncGroupProfileEditor();
+    refreshGroupProfileControls();
     document.getElementById('dc-group-profile-name')?.focus({ preventScroll: true });
     toast.success(`Group profile "${escapeHtml(profile.name)}" deleted.`);
 }
@@ -3284,6 +3420,11 @@ function getVisibleCharacterEntries() {
 
 export function updateCharList() {
     const list = document.getElementById('dc-char-list'); if (!list) return;
+    // Saves replace the registry object too; only a different storage key
+    // invalidates drafts even when the rendered rows are otherwise identical.
+    const tableKey = getStorageKeyForScope(getCurrentStorageScope(), { persistMetadata: false });
+    const tableChanged = lastRenderedTableKey !== tableKey;
+    lastRenderedTableKey = tableKey;
     const narratorEditor = document.getElementById('dc-narrator-editor');
     const narratorSignature = JSON.stringify(normalizeNarratorStyle(settings.narratorStyle, { legacy: settings }));
     if (narratorEditor && narratorEditor.dataset.narratorSignature !== narratorSignature) renderNarratorEditor();
@@ -3323,8 +3464,6 @@ export function updateCharList() {
         if (!document.getElementById('dc-gradient-gallery')?.contains(document.activeElement)) renderGradientPresetGallery();
         registerGradientAnimationRoot(document.getElementById('dc-ext'));
         refreshGradientAnimationState();
-        restoreScrollPositions(scrollPositions);
-        requestAnimationFrame(() => restoreScrollPositions(scrollPositions));
         return;
     }
 
@@ -3369,7 +3508,7 @@ export function updateCharList() {
         let node = existing.get(item.blockKey);
         const containsActiveEditor = !!node?.contains(activeElement)
             && !!activeElement?.matches?.('input[type="text"], input[type="search"], input[type="number"], input[type="range"], input[type="color"], textarea');
-        if (!(node && (node.getAttribute('data-dc-sig') === item.sig || containsActiveEditor))) {
+        if (!(node && !tableChanged && (node.getAttribute('data-dc-sig') === item.sig || containsActiveEditor))) {
             node = htmlToNode(item.html);
             node.setAttribute('data-dc-block', item.blockKey);
             node.setAttribute('data-dc-sig', item.sig);
@@ -3499,7 +3638,7 @@ export function renameCharacter(oldNameOrKey, newName, { notify = false, renameP
         if (notify) toast.warning('That character is no longer in the list.');
         return false;
     }
-    if (!rawName || !nextName || !nextKey || /[\r\n\t\[\]=,()]/.test(rawName)) {
+    if (!rawName || !nextName || !nextKey || /[\r\n\t\[\]=,()]/.test(rawName.normalize('NFKC'))) {
         if (notify) toast.warning('Character names cannot contain brackets, commas, equals signs, parentheses, line breaks, reserved words, or more than 120 characters.');
         return false;
     }
@@ -3636,6 +3775,8 @@ function getImportAnalysisError(analysis, kind) {
     }
     return '';
 }
+
+let importAnalysisRequestId = 0;
 
 async function runImportAnalysis(task, label, onError = null) {
     try {
@@ -3797,7 +3938,7 @@ async function buildStylePackExport(opener) {
         </fieldset>`;
     const formHtml = `
         <div class="dc-style-pack-form">
-            <label>Pack name <input class="text_pole" type="text" maxlength="120" data-dialog-field="name" data-dialog-autofocus value="My Dialogue Colors" required></label>
+            <label>Pack name <input class="text_pole" type="text" maxlength="120" data-dialog-field="name" data-dialog-autofocus value="My Dialogue Colors" required pattern=".*\\S.*" title="Enter a style-pack name."></label>
             <label>Identifier <input class="text_pole" type="text" maxlength="120" data-dialog-field="id" placeholder="Optional"></label>
             <label>Version <input class="text_pole" type="text" maxlength="80" data-dialog-field="version" placeholder="Optional"></label>
             <label>Author <input class="text_pole" type="text" maxlength="160" data-dialog-field="author" placeholder="Optional"></label>
@@ -3811,17 +3952,12 @@ async function buildStylePackExport(opener) {
         formHtml,
         opener,
         choices: [
-            { value: 'build', label: 'Build pack', primary: true },
+            { value: 'build', label: 'Build pack', primary: true, validate: true },
             { value: 'cancel', label: 'Cancel' },
         ],
     });
     if (decision.value !== 'build') return;
     const name = String(decision.formValues.name || '').trim();
-    if (!name) {
-        announceStylePack('A style-pack name is required.');
-        toast.warning('Enter a style-pack name.');
-        return;
-    }
     try {
         const selectedPalettes = selectedStylePackNames(decision.selected, 'palettes');
         const selectedGradients = selectedStylePackNames(decision.selected, 'gradientPresets');
@@ -4649,6 +4785,8 @@ export function enterSettingsFullscreen(opener = document.activeElement) {
     panel.classList.add('dc-fullscreen');
     attributes.forEach(([name, , value]) => panel.setAttribute(name, value));
     document.body.classList.add('dc-fullscreen-open');
+    const legend = document.getElementById('dc-legend-float');
+    if (legend) legend.style.display = 'none';
     toggle?.setAttribute('aria-pressed', 'true');
     showSettingsPageSection(activeSettingsPageSlug);
     document.querySelector('#dc-page-nav .dc-page-tab[aria-selected="true"]')?.focus();
@@ -4676,6 +4814,7 @@ export function exitSettingsFullscreen() {
     // back the open/closed state the user actually chose.
     showSettingsPageSection(activeSettingsPageSlug);
     applyPanelDisclosureState(panel);
+    updateLegend();
     const opener = fullscreenOpener?.isConnected ? fullscreenOpener : toggle;
     fullscreenOpener = null;
     if (opener?.offsetParent) opener.focus();
@@ -5158,6 +5297,7 @@ function bindSettingsPanelControls($) {
             copiedGradientGenerator = fieldMask & CHARACTER_STYLE_FIELD_MASKS.GRADIENT
                 ? normalizeEntryGradientGenerator(characterColors[selectedKeys[0]]?.gradientGenerator, characterColors[selectedKeys[0]]?.gradient)
                 : null;
+            copiedGradientFieldIncluded = !!(fieldMask & CHARACTER_STYLE_FIELD_MASKS.GRADIENT);
             updateBulkToolbar();
             toast.success(`Copied style from ${escapeHtml(copied.sourceName)}.`);
         } else if (action === 'paste') {
@@ -5165,7 +5305,7 @@ function bindSettingsPanelControls($) {
             if (!fieldMask) { toast.info('Choose at least one paste field.'); return; }
             runSelectedCharacterMutation(keys => {
                 const result = pasteCharacterStyle(keys, fieldMask);
-                if (!(fieldMask & CHARACTER_STYLE_FIELD_MASKS.GRADIENT)) return result;
+                if (!(fieldMask & CHARACTER_STYLE_FIELD_MASKS.GRADIENT) || !copiedGradientFieldIncluded) return result;
                 const changedKeys = new Set(result.changedKeys || []);
                 keys.forEach(key => {
                     const entry = characterColors[key];
@@ -5204,14 +5344,18 @@ function bindSettingsPanelControls($) {
     // damaged after switching to the DOM engine, so the button has to be reachable in both.
     $('dc-repair-tool-calls').onclick = async e => {
         const button = e.currentTarget;
-        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+        syncProcessControlState();
         try {
             await applyToolCallMessageRepair();
         } catch (error) {
             console.error('[Dialogue Colors] Tool-call repair failed:', error);
             toast.error('Could not repair tool-call messages. See the browser console for details.');
         } finally {
-            button.disabled = false;
+            // Recompute from aria-busy + enabled state so the shared refresh
+            // keeps the button disabled while the extension is off.
+            button.removeAttribute('aria-busy');
+            syncProcessControlState();
         }
     };
     $('dc-recolor').onclick = async e => {
@@ -5302,7 +5446,7 @@ function bindSettingsPanelControls($) {
             opener: e.currentTarget,
         })) restoreAllSettingsToDefaults();
     };
-    $('dc-group-profile-name').onchange = syncGroupProfileEditor;
+    $('dc-group-profile-name').onchange = refreshGroupProfileControls;
     $('dc-group-profile-save').onclick = saveGroupProfileFromEditor;
     $('dc-group-profile-rename-button').onclick = renameGroupProfileFromEditor;
     $('dc-group-profile-delete').onclick = e => { deleteGroupProfileFromEditor(e.currentTarget); };
@@ -5378,6 +5522,7 @@ function bindSettingsPanelControls($) {
         const file = e.target.files?.[0];
         e.target.value = '';
         if (!file) return;
+        const requestId = ++importAnalysisRequestId;
         if (Number.isFinite(file.size) && file.size > STYLE_PACK_FILE_LIMIT) {
             announceStylePack('Style packs are limited to 1 MiB. The file was not read.');
             toast.error('Style packs are limited to 1 MiB.');
@@ -5388,6 +5533,7 @@ function bindSettingsPanelControls($) {
             'Style pack',
             announceStylePack,
         );
+        if (requestId !== importAnalysisRequestId) return;
         if (!analysis) return;
         await reviewAndApplyStylePack(analysis, $('dc-style-pack-import'));
     };
@@ -5437,6 +5583,7 @@ function bindSettingsPanelControls($) {
         }
     };
     $('dc-save-card').onclick = async e => {
+        const opener = e.currentTarget;
         const binding = captureUiMutationContext();
         const existing = await runImportAnalysis(() => readCardData(), 'Card data');
         if (!existing) return;
@@ -5460,7 +5607,7 @@ function bindSettingsPanelControls($) {
                 description: `This card already stores ${count} character${count === 1 ? '' : 's'}. Its saved Dialogue Colors payload will be replaced with the current table.`,
                 confirmLabel: 'Replace card data',
                 danger: true,
-                opener: e.currentTarget,
+                opener,
             });
             if (!confirmed) return;
         } else if (existing.error !== 'no_card_data') {
@@ -5479,8 +5626,12 @@ function bindSettingsPanelControls($) {
         return saveToCard();
     };
     $('dc-load-card').onclick = async e => {
+        const opener = e.currentTarget;
+        const requestId = ++importAnalysisRequestId;
         const analysis = await runImportAnalysis(() => readCardData(), 'Card data');
-        if (analysis) await reviewAndApplyImport(analysis, 'card', e.currentTarget);
+        // A newer import read superseded this one; never open its stale review.
+        if (requestId !== importAnalysisRequestId) return;
+        if (analysis) await reviewAndApplyImport(analysis, 'card', opener);
     };
     $('dc-undo').onclick = undo;
     $('dc-redo').onclick = redo;
@@ -5491,7 +5642,10 @@ function bindSettingsPanelControls($) {
         const file = e.target.files[0];
         e.target.value = '';
         if (!file) return;
+        const requestId = ++importAnalysisRequestId;
         const analysis = await runImportAnalysis(() => analyzeColorImport(file), 'Color import');
+        // A newer import read superseded this one; never open its stale review.
+        if (requestId !== importAnalysisRequestId) return;
         if (analysis) await reviewAndApplyImport(analysis, 'colors', $('dc-import'));
     };
     $('dc-export-settings').onclick = exportSettings;
@@ -5500,7 +5654,10 @@ function bindSettingsPanelControls($) {
         const file = e.target.files[0];
         e.target.value = '';
         if (!file) return;
+        const requestId = ++importAnalysisRequestId;
         const analysis = await runImportAnalysis(() => analyzeSettingsImport(file), 'Settings import');
+        // A newer import read superseded this one; never open its stale review.
+        if (requestId !== importAnalysisRequestId) return;
         if (analysis) await reviewAndApplyImport(analysis, 'settings', $('dc-import-settings'));
     };
     $('dc-setup-autosync').onclick = () => { enableAutoSync(); updateAutoSyncUI(); };

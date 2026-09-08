@@ -359,7 +359,13 @@ export function regenerateAllColors() {
 
     for (const [key, char] of sortedEntries) {
         if (!char.locked) {
-            setEntryFromBaseColor(char, suggestColorForName(char.name) || getNextColor());
+            // Name-based suggestions bypassed the uniqueness resolver before,
+            // so Rose and Rosemary could both land on the same hue. Resolve
+            // every candidate through the same conflict-aware assignment that
+            // creation uses, excluding this entry's own old colour.
+            const suggested = suggestColorForName(char.name);
+            const chosen = resolveUniqueAssignedColor(suggested ? applyThemeReadabilityAndBrightness(suggested) : null, [key], { baseColor: suggested });
+            setEntryFromBaseColor(char, chosen.baseColor);
             changedKeys.push(key);
         }
     }
@@ -1364,32 +1370,48 @@ export function getContrastRatio(foreground, background) {
     return (lighter + 0.05) / (darker + 0.05);
 }
 
-export function getTextContrastSurfaceColor(foreground, surfaceColor = null) {
+export function getTextHighlightState(foreground, surfaceColor = null) {
     const surface = normalizeHexColor(surfaceColor, null) || getContrastSurfaceColor();
-    if (settings.highlightMode !== true) return surface;
+    const plain = { color: '', surface };
+    if (settings.highlightMode !== true) return plain;
     const text = parseCssColor(normalizeHexColor(foreground)) || { r: 136, g: 136, b: 136 };
     const background = parseCssColor(surface) || { r: 0, g: 0, b: 0 };
     const alpha = 0x26 / 255;
-    return rgbToHex({
+    const highlightedSurface = rgbToHex({
         r: text.r * alpha + background.r * (1 - alpha),
         g: text.g * alpha + background.g * (1 - alpha),
         b: text.b * alpha + background.b * (1 - alpha),
     });
+    // A same-colour tint can make AA impossible on middle-grey surfaces.
+    // Omit it rather than promise contrast the renderer cannot deliver.
+    return getContrastRatio(foreground, highlightedSurface) >= 4.5
+        ? { color: `${normalizeHexColor(foreground)}26`, surface: highlightedSurface }
+        : plain;
+}
+
+export function getTextContrastSurfaceColor(foreground, surfaceColor = null) {
+    return getTextHighlightState(foreground, surfaceColor).surface;
 }
 
 function ensureContrastAgainst(hexColor, getSurface, minimumRatio) {
     const normalized = normalizeHexColor(hexColor);
-    if (getContrastRatio(normalized, getSurface(normalized)) >= minimumRatio) return normalized;
+    let best = normalized;
+    let bestRatio = getContrastRatio(normalized, getSurface(normalized));
+    if (bestRatio >= minimumRatio) return normalized;
     const [hue, saturation, lightness] = hexToHsl(normalized);
-    const referenceSurface = getSurface(normalized);
-    const towardLight = getContrastRatio('#ffffff', referenceSurface) >= getContrastRatio('#000000', referenceSurface);
+    const towardLight = getContrastRatio('#ffffff', getSurface('#ffffff')) >= getContrastRatio('#000000', getSurface('#000000'));
     const end = towardLight ? 100 : 0;
     const direction = towardLight ? 1 : -1;
-    for (let nextLightness = lightness + direction; towardLight ? nextLightness <= end : nextLightness >= end; nextLightness += direction) {
+    for (let step = 1; step <= 100; step++) {
+        const nextLightness = Math.max(0, Math.min(100, lightness + direction * step));
         const candidate = hslToHex(hue, saturation, nextLightness);
-        if (getContrastRatio(candidate, getSurface(candidate)) >= minimumRatio) return candidate;
+        const ratio = getContrastRatio(candidate, getSurface(candidate));
+        if (ratio >= minimumRatio) return candidate;
+        if (ratio > bestRatio) { bestRatio = ratio; best = candidate; }
+        if (nextLightness === end) break;
     }
-    return towardLight ? '#ffffff' : '#000000';
+    // A caller can request an impossible ratio (above 21); retain the best.
+    return best;
 }
 
 export function ensureReadableContrast(hexColor, surfaceColor = null, minimumRatio = 4.5) {
@@ -1790,6 +1812,16 @@ export function collectAssignedColors(excludeKeys = []) {
         if (!entry || excluded.has(key)) continue;
         const color = normalizeHexColor(getEntryEffectiveColor(entry), null);
         if (color && !colors.includes(color)) colors.push(color);
+        // Gradient stops are displayed too; assigning a stop colour to another
+        // character would make the two visuals collide at zero distance.
+        // ponytail: O(entries x stops) per call; memoize stop settling if big
+        // tables make regeneration feel slow.
+        for (const stop of entry?.gradient?.stops || []) {
+            for (const candidate of [stop.color, applyThemeReadabilityAndBrightness(stop.baseColor)]) {
+                const stopColor = normalizeHexColor(candidate, null);
+                if (stopColor && !colors.includes(stopColor)) colors.push(stopColor);
+            }
+        }
     }
     if (!excluded.has(NARRATOR_VISUAL_ID)) {
         const narrator = getNarratorVisual(settings, applyThemeReadabilityAndBrightness);
@@ -1817,6 +1849,10 @@ export function collectAssignedBaseColors(excludeKeys = []) {
         if (!entry || excluded.has(key)) continue;
         const color = normalizeHexColor(getBaseColor(entry), null);
         if (color && !colors.includes(color)) colors.push(color);
+        for (const stop of entry?.gradient?.stops || []) {
+            const stopColor = normalizeHexColor(stop.baseColor, null);
+            if (stopColor && !colors.includes(stopColor)) colors.push(stopColor);
+        }
     }
     if (!excluded.has(NARRATOR_VISUAL_ID)) {
         const narrator = getNarratorVisual(settings, applyThemeReadabilityAndBrightness);
@@ -1853,15 +1889,20 @@ export function isAssignedColorConflict(candidateColor, reservedColors = []) {
 // never has to run a lossy pass backwards to recover it. options.baseColor is the base the
 // preferred color came from.
 export function resolveUniqueAssignedColor(preferredColor, excludeKeys = [], options = {}) {
-    const reservedColors = collectAssignedColors(excludeKeys);
-    const reservedBaseColors = collectAssignedBaseColors(excludeKeys);
+    const reservedColors = options.avoidConflicts === false ? [] : collectAssignedColors(excludeKeys);
+    const reservedBaseColors = options.avoidConflicts === false ? [] : collectAssignedBaseColors(excludeKeys);
     const normalizedPreferred = normalizeHexColor(preferredColor, null);
     const preferredBaseColor = normalizeHexColor(options.baseColor, null);
     const resolveBaseColor = (candidate, knownBaseColor) => knownBaseColor || deriveBaseColorFromEffectiveColor(candidate);
-    if (normalizedPreferred && !isAssignedColorConflict(normalizedPreferred, reservedColors)) {
-        const baseColor = resolveBaseColor(normalizedPreferred, preferredBaseColor);
-        if (!isAssignedColorConflict(baseColor, reservedBaseColors)) {
-            return { color: normalizedPreferred, baseColor, remapped: false };
+    if (normalizedPreferred) {
+        // Settle the exact pair that the next save will render, then test it.
+        const preferred = {};
+        if (preferredBaseColor) setEntryFromBaseColor(preferred, preferredBaseColor);
+        else setEntryFromEffectiveColor(preferred, normalizedPreferred);
+        const { color: settledPreferred, baseColor } = preferred;
+        if (!isAssignedColorConflict(baseColor, reservedBaseColors)
+            && !isAssignedColorConflict(settledPreferred, reservedColors)) {
+            return { color: settledPreferred, baseColor, remapped: settledPreferred !== normalizedPreferred };
         }
     }
 
@@ -1967,9 +2008,10 @@ export function buildCharacterEntry(name, options = {}) {
     const preferredBaseColor = colorMode === 'effective'
         ? (normalizedSourceColor ? null : fallbackBaseColor)
         : (normalizedSourceColor || fallbackBaseColor);
-    const assignment = options.avoidConflicts === false
-        ? { color: normalizeHexColor(preferredAssignedColor, '#888888'), baseColor: preferredBaseColor, remapped: false }
-        : resolveUniqueAssignedColor(preferredAssignedColor, [key], { baseColor: preferredBaseColor });
+    const assignment = resolveUniqueAssignedColor(preferredAssignedColor, [key], {
+        baseColor: preferredBaseColor,
+        avoidConflicts: options.avoidConflicts,
+    });
     const { color: assignedColor, remapped } = assignment;
     const baseColor = normalizeHexColor(assignment.baseColor, deriveBaseColorFromEffectiveColor(assignedColor));
     const suppliedGradient = resolveReadableGradient(normalizeGradient(options.gradient), assignedColor);

@@ -56,6 +56,7 @@ const {
 const { fillUncoloredDialogueGaps, finalizeLLMColorizedText, repairHtmlBreakingColorSpans } = await import('../src/live-colors.js');
 const { maskHtmlTagQuotes, splitsHtmlTag, findHtmlTagRanges } = await import('../src/utils.js');
 const state = await import('../src/state.js');
+const { collectFontColorsFromText, countFontColorOccurrencesFromText, countNarratorFontTagsFromText } = await import('../src/color-blocks.js');
 hooks.deregister();
 
 const settings = state.settings;
@@ -171,6 +172,21 @@ test('a span that wraps a whole element is valid markup and survives', () => {
     });
 });
 
+test('a span crossing between separate elements is rejected', () => {
+    const crossed = '<b>"One</b> and <b>Two"</b>';
+    const start = crossed.indexOf('"One');
+    const end = crossed.indexOf('Two"') + 'Two"'.length;
+    assert.equal(splitsHtmlTag(start, end, findHtmlTagRanges(crossed)), true,
+        'boundaries inside two different <b> elements are not one safe span');
+
+    withCleanRegistry(() => {
+        bobColor();
+        const result = colorizeMessageText(crossed, 'Bob', { autoAddMessageSpeaker: true });
+        assert.equal(result.changed, false, 'the crossing span stays untouched');
+        assert.equal(result.updatedText, crossed);
+    });
+});
+
 test('splitsHtmlTag only rejects boundaries strictly inside a tag', () => {
     const text = '<div class="row">"Hi."</div>';
     const ranges = findHtmlTagRanges(text);
@@ -255,7 +271,80 @@ test('the repair declines markup this extension did not write', () => {
     assert.equal(chat[0].mes, foreign);
 });
 
+test('user-authored formatting survives the repair sweep byte-identical', () => {
+    withCleanRegistry(() => {
+        const color = bobColor();
+        // Damage this repair would normally fix: a font tag wrapping an
+        // attribute value inside a tag. Inside a user message it is
+        // user-authored content and must stay byte-identical.
+        const authored = `<div class=<font color="${color}">"row"</font>>"Hi."</div>`;
+        const chat = [
+            { name: 'User', is_user: true, mes: authored },
+            { name: 'Bob', mes: `<div class=<font color="${color}">"stat"</font>>Bob said, "Hello."</div>` },
+        ];
+        assert.deepEqual(repairHtmlBreakingColorSpans(chat).repairedIndices, [1]);
+        assert.equal(chat[0].mes, authored, 'user messages are off limits');
+    });
+});
+
 test('attribute quotes do not tip the streaming parity count', () => {
     assert.equal(balanceStreamingText('<img src="x.png"> Bob waves'), '<img src="x.png"> Bob waves');
     assert.equal(balanceStreamingText('<img src="x.png"> "Hel'), '<img src="x.png"> "Hel"');
+});
+
+test('literal font-tag examples do not count as persisted colours', () => {
+    const inline = 'Syntax: `<font color="#ff0000">example</font>`';
+    assert.deepEqual([...collectFontColorsFromText(inline)], [],
+        'an inline code sample is not a real colour span');
+    assert.equal(countFontColorOccurrencesFromText(inline).size, 0,
+        'the tally must ignore code samples too');
+
+    const fenced = '```\n<font color="#ff0000">example</font>\n```';
+    assert.deepEqual([...collectFontColorsFromText(fenced)], [],
+        'a fenced code sample is not a real colour span');
+
+    const mixed = `${inline}\nAlice said <font color="#112233">"Hi."</font>`;
+    assert.deepEqual([...collectFontColorsFromText(mixed)].sort(), ['#112233'],
+        'a real span outside the code sample still counts');
+    assert.equal(countFontColorOccurrencesFromText(mixed).size, 1);
+});
+
+test('colour scans preserve code boundaries and ignore markup-looking attribute values', () => {
+    for (const source of [
+        '<fo`example`nt color="#ff0000">fake</font>',
+        '<font color="`example`#ff0000">fake</font>',
+        '<span title=\'<font color="#ff0000">\'>fake</span>',
+        '<font data-color="#ff0000">fake</font>',
+        '<font title=\'color="#ff0000"\'>fake</font>',
+        '<!--\n<font color="#ff0000">comment</font>\n-->',
+        '<!--\n<font color="#ff0000">unclosed comment</font>',
+        '<code><font color="#ff0000">code</font></code>',
+        '<code/><font color="#ff0000">code</font></code>',
+        '<pre/><font color="#ff0000">code</font></pre>',
+        '\\<font color="#ff0000">escaped tag</font>',
+        '<pre title=">"><font color="#ff0000">code</font></pre>',
+        '````\n```\n<font color="#ff0000">code</font>\n```\n````',
+        '~~~\n<font color="#ff0000">unclosed fence</font>',
+    ]) {
+        assert.deepEqual([...collectFontColorsFromText(source)], [], source);
+        assert.equal(countFontColorOccurrencesFromText(source).size, 0, source);
+    }
+    const source = '<font title="`" color="#112233">one</font><font title="`" color="#112233">two</font>';
+    assert.deepEqual([...collectFontColorsFromText(source)], ['#112233']);
+    assert.deepEqual([...countFontColorOccurrencesFromText(source)], [['#112233', 2]]);
+    assert.deepEqual(countNarratorFontTagsFromText('`<font color="#112233">code</font>`\n[COLORS:Narrator=#112233]'), { present: true, count: null });
+    for (const prefix of ['Syntax: `<code>`\n', 'Syntax: `<pre>`\n', '<code>`</code>\n', 'An unmatched ` tick\n', 'An escaped \\` tick\n', '```<font color="#ff0000">example</font>```\n', '<!-- <code> ``` -->\n', '```html\r\n<code>\r\n```\r\n']) {
+        const actual = `${prefix}<font color="#112233">actual</font>`;
+        assert.deepEqual([...collectFontColorsFromText(actual)], ['#112233'], actual);
+    }
+});
+
+test('raw-element closing tags preserve the enclosing element identity', () => {
+    const source = '<b><code>example</code>"Safe"</b>';
+    const ranges = findHtmlTagRanges(source);
+    const start = source.indexOf('"Safe"');
+    assert.equal(splitsHtmlTag(start, start + 6, ranges), false);
+    assert.deepEqual(ranges.find(range => range.name === 'code' && range.closing).stackAfter, ranges.at(-1).stackBefore);
+    const selfClosing = '<code/>"Example"</code>';
+    assert.equal(splitsHtmlTag(7, 16, findHtmlTagRanges(selfClosing)), true);
 });

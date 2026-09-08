@@ -209,6 +209,12 @@ export const streamingSession = {
     painting: false,
 };
 
+// The painter's stable assignment cache. It lives here (not in streaming-paint)
+// so the override mutation sites in dom-engine can invalidate it together with
+// streamingSession.assignments; otherwise 'use automatic attribution' keeps
+// painting the removed override's speaker.
+export const stableSegmentAssignments = new Map();
+
 export const LIVE_CHAT_SAVE_DELAY_MS = 350;
 
 export const COLOR_STATE_SAVE_DELAY_MS = 180;
@@ -346,6 +352,7 @@ export function resetStreamingSession() {
     streamingSession.active = false;
     streamingSession.mesIndex = -1;
     streamingSession.assignments.clear();
+    stableSegmentAssignments.clear();
     streamingSession.mesElement = null;
     streamingSession.mesText = null;
     streamingSession.observer = null;
