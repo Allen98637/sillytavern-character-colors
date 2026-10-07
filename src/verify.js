@@ -13,8 +13,23 @@ import { AUTO_ATTRIBUTION_VERIFY_DELAY_MS, AUTO_ATTRIBUTION_VERIFY_RENDERED_LIMI
 import { setVerifyAttributionButtonBusy } from './ui.js';
 import { getMessageElementByIndex, hashMessageText, isCompositeSpeakerLabel, toast } from './utils.js';
 
+// The welcome-page greeting is an ordinary (non-system) message that SillyTavern
+// labels 'assistant_message'. That chat is never saved, so a verdict can never
+// stick and every visit to the welcome page would pay for a fresh request.
+function isWelcomeAssistantMessage(msg) {
+    return msg?.extra?.type === 'assistant_message';
+}
+
+// A swipe still waiting for its first streamed piece: SillyTavern has already moved
+// swipe_id to a slot that does not exist yet, while mes still holds the previous
+// swipe's text. Checking it would verify text that is about to be replaced.
+function isPendingSwipe(msg) {
+    return Array.isArray(msg?.swipes) && Number.isInteger(msg?.swipe_id) && msg.swipe_id >= msg.swipes.length;
+}
+
 export function isMessageEligibleForAttributionVerification(msg) {
-    return !!msg && !isHostSystemOrToolMessage(msg) && !!msg.mes && !collectFontColorsFromText(msg.mes).size;
+    return !!msg && !isHostSystemOrToolMessage(msg) && !isWelcomeAssistantMessage(msg) && !isPendingSwipe(msg)
+        && !!msg.mes && !collectFontColorsFromText(msg.mes).size;
 }
 
 export const MAX_ATTRIBUTION_VERIFIER_RESPONSE_CHARS = 65536;

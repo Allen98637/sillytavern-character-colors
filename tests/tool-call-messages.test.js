@@ -187,6 +187,53 @@ test('actual host system and tool messages share the non-dialogue gate', () => {
     assert.equal(isMessageEligibleForAttributionVerification(toolMessage()), false);
 });
 
+test('the welcome-page greeting is never sent for attribution verification', () => {
+    // welcome-screen.js pushes it as an ordinary message, is_system false, so the
+    // host system gate alone does not catch it.
+    const greeting = {
+        name: 'Assistant',
+        is_system: false,
+        is_user: false,
+        mes: 'Set any character as your welcome page assistant from their "More..." menu.',
+        extra: { type: 'assistant_message', swipeable: false },
+    };
+    assert.equal(isHostSystemOrToolMessage(greeting), false);
+    assert.equal(isMessageEligibleForAttributionVerification(greeting), false);
+});
+
+test('a swipe still waiting for its first streamed piece is not verified', () => {
+    // SillyTavern moves swipe_id past the saved swipes before generating, and mes still
+    // holds the previous swipe's text until the new reply starts arriving.
+    const pending = {
+        name: 'Alice',
+        is_system: false,
+        is_user: false,
+        mes: '"Old swipe."',
+        swipe_id: 2,
+        swipes: ['"First."', '"Old swipe."'],
+        extra: {},
+    };
+    assert.equal(isMessageEligibleForAttributionVerification(pending), false);
+});
+
+test('a swipe whose slot exists is still verified', () => {
+    // Finished new swipes and swipes back to an older reply both have their slot.
+    const finished = {
+        name: 'Alice',
+        is_system: false,
+        is_user: false,
+        mes: '"New swipe."',
+        swipe_id: 2,
+        swipes: ['"First."', '"Old swipe."', '"New swipe."'],
+        extra: {},
+    };
+    assert.equal(isMessageEligibleForAttributionVerification(finished), true);
+    assert.equal(isMessageEligibleForAttributionVerification({ ...finished, swipe_id: 0 }), true);
+    // Messages without swipe data, as in older chats, are unaffected.
+    const { swipes, swipe_id, ...plain } = finished;
+    assert.equal(isMessageEligibleForAttributionVerification(plain), true);
+});
+
 test('a historically colorized tool-call payload is reversed byte for byte', () => {
     withCleanRegistry(() => {
         ensureCharacterEntry('Emily');
