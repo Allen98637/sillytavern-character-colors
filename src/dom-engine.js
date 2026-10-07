@@ -16,6 +16,7 @@ import { applyTextStyle, clearTextStyle, TEXT_STYLE_MARKER_ATTRIBUTE } from './t
 import { updateLegend } from './ui.js';
 import { captureOpenDetailsState, getGoogleFontFamily, getMessageElementByIndex, hashMessageText, normalizeSegmentText, restoreOpenDetailsState, stripColorBlocks } from './utils.js';
 import { queueAutoAttributionVerificationForElements, queueAutoAttributionVerificationForMessage, queueAutoAttributionVerificationForRenderedMessages } from './verify.js';
+import { TEXT_OUTLINE_CLASS, applyTextOutline, clearTextOutline, getTextOutlineState } from './text-outline-rendering.js';
 
 function getStableMessageId(message) {
     for (const value of [message?.id, message?.send_date]) {
@@ -1889,6 +1890,8 @@ function isSegmentOwnedVisualCurrent(seg, el) {
         ? seg.assignment.key
         : resolveCharacterKeyByNameOrAlias(seg.assignment.name || seg.assignment.key);
     const entry = entryKey ? characterColors[entryKey] : null;
+    const outline = getTextOutlineState(entry);
+    if (el.classList.contains(TEXT_OUTLINE_CLASS) !== outline.enabled) return false;
     const visual = getVisualRenderState(entry || { color: seg.assignment.color, baseColor: seg.assignment.color }, { target: 'chat' });
     const hasGradient = !!visual.gradientCss;
     if (el.classList.contains('dc-gradient-text') !== hasGradient) return false;
@@ -2042,6 +2045,7 @@ export function applySegmentDecoration(seg, el) {
     const displayVisual = getVisualRenderState(entry || { color: seg.assignment.color, baseColor: seg.assignment.color }, { target: 'chat' });
     applyOwnedStyle(el, 'color', displayVisual.fallbackColor, SEGMENT_COLOR_STATE_ATTRIBUTE, legacyOwned);
     applyTextStyle(el, entry?.style);
+    applyTextOutline(el, entry);
     const font = entry?.font || seg.assignment.font;
     const family = getGoogleFontFamily(font);
     if (family) {
@@ -2066,6 +2070,7 @@ export function clearSegmentDecoration(el, options = {}) {
     const legacyOwned = el.hasAttribute('data-dc-colored') && !el.hasAttribute(SEGMENT_COLOR_STATE_ATTRIBUTE);
     clearGradientText(el);
     clearTextStyle(el);
+    clearTextOutline(el);
     clearOwnedStyle(el, 'color', SEGMENT_COLOR_STATE_ATTRIBUTE, legacyOwned);
     clearOwnedStyle(el, 'background-color', SEGMENT_HIGHLIGHT_STATE_ATTRIBUTE, legacyOwned);
     clearOwnedStyle(el, 'font-family', SEGMENT_FONT_STATE_ATTRIBUTE, legacyOwned);

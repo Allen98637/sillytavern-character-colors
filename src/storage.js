@@ -715,7 +715,7 @@ export function normalizeStoredSettings(source) {
         if (hasOwn(source, key)) normalized[key] = normalizeBoolean(source[key], fallback);
     }
 
-    if (hasOwn(source, 'themeMode')) normalized.themeMode = ['auto', 'dark', 'light'].includes(source.themeMode) ? source.themeMode : 'auto';
+    if (hasOwn(source, 'themeMode')) normalized.themeMode = ['auto', 'dark', 'light', 'raw'].includes(source.themeMode) ? source.themeMode : 'auto';
     if (hasOwn(source, 'colorTheme')) {
         const theme = normalizeSettingString(source.colorTheme, 127, 'pastel');
         const customName = theme.slice(0, 7).toLowerCase() === 'custom:'
@@ -729,6 +729,7 @@ export function normalizeStoredSettings(source) {
         const value = parseSettingNumber(source.brightness);
         normalized.brightness = Number.isFinite(value) ? Math.max(-100, Math.min(100, Math.round(value))) : 0;
     }
+
     if (hasOwn(source, 'thoughtSymbols')) {
         normalized.thoughtSymbols = typeof source.thoughtSymbols === 'string'
             ? source.thoughtSymbols.replace(/[\u0000-\u001F\u007F]/g, '').slice(0, 64)

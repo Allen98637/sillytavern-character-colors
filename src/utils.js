@@ -61,6 +61,14 @@ export function getGoogleFontFamily(fontName) {
     return `"${normalized.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}", sans-serif`;
 }
 
+export function normalizeTextOutlineWidth(value, fallback = 1) {
+    const number = Number(value);
+
+    return Number.isFinite(number)
+        ? Math.max(0.25, Math.min(3, number))
+        : fallback;
+}
+
 export function normalizeCharacterEntry(entry, fallbackName = '') {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
     const rawName = Object.prototype.hasOwnProperty.call(entry, 'name') ? entry.name : fallbackName;
@@ -76,6 +84,9 @@ export function normalizeCharacterEntry(entry, fallbackName = '') {
         keep: !!entry?.keep,
         aliases: normalizeAliases(entry?.aliases),
         style: VALID_STYLES.has(entry?.style) ? entry.style : '',
+        outlineEnabled: entry?.outlineEnabled === true,
+        outlineColor: normalizeHexColor(entry?.outlineColor, '#000000'),
+        outlineWidth: normalizeTextOutlineWidth(entry?.outlineWidth, 1),
         dialogueCount: Number.isFinite(entry?.dialogueCount) && entry.dialogueCount > 0 ? Math.floor(entry.dialogueCount) : 0,
         group: normalizeGroupName(entry?.group),
         font: normalizeGoogleFontName(entry?.font),

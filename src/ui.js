@@ -20,7 +20,7 @@ import { escapeHtml, eventSource, event_types, getContext } from './st-api.js';
 import { autoRecolorHintShown, characterColors, expandedCharacterRows, groupProfiles, isDomEngine, searchTerm, selectedCharacterKeys, setAutoRecolorHintShown, setCharacterColors, setGroupProfiles, setSearchTerm, setSwapMode, settings, swapMode, synchronizeEnabledLifecycle } from './state.js';
 import { analyzeColorImport, analyzeSettingsImport, analyzeStylePackImport, applyCardData, applyColorImport, applySettingsImport, applyStylePackImport, archiveStoredColorData, deleteCustomGradientPreset, disableAutoSync, enableAutoSync, exportColors, exportSettings, getArchivedColorData, getCurrentStorageScope, getCustomGradientPresets, getLegendPosition, getPinnedPersonaColors, getStorageKey, getStorageKeyForScope, getStorageLabelForKey, getStorageScopeDescriptor, getStoredColorDataFingerprint, getStylePackRegistry, getUserColorDataStore, markCardCharactersKept, markCurrentPersonaKept, normalizeColorDataEntry, normalizeToggleSettings, readCardData, removePinnedCharacterKey, renameCustomGradientPreset, renamePinnedPersonaColor, restoreAllSettingsToDefaults, restoreArchivedColorData, restorePinnedPersonaColor, saveCustomGradientPreset, saveData, saveLegendPosition, saveToCard, switchColorStorageScope, syncPinnedPersonaColors, updateAutoSyncUI } from './storage.js';
 import { buildStylePackEnvelope } from './style-pack-adapter.js';
-import { escapeAttr, getGoogleFontFamily, htmlToNode, normalizeEntryGradientGenerator, normalizeGoogleFontName, normalizeHexColor, normalizeManualColorInput, toast } from './utils.js';
+import { escapeAttr, getGoogleFontFamily, htmlToNode, normalizeEntryGradientGenerator, normalizeGoogleFontName, normalizeHexColor, normalizeManualColorInput, normalizeTextOutlineWidth, toast } from './utils.js';
 import { AUTO_HIGH_ATTRIBUTION_CONFIDENCE, cancelStreamingAttributionVerification, clearAutoAttributionVerificationQueue, getAttributionVerifyPasses, queueAutoAttributionVerificationForRenderedMessages, runAttributionVerification, verifyLatestAttributionsWithLLM, verifyVisibleAttributionsWithLLM } from './verify.js';
 
 export const DYNAMIC_CONTROL_HELP_TEXT = Object.freeze({
@@ -1790,6 +1790,14 @@ function refreshGradientVisualSurfaces(keys = Object.keys(characterColors)) {
 export function buildCharRowHtml(k, v) {
     const safeKey = escapeAttr(k);
     const colorControlId = buildCharacterControlId('dc-color', k);
+    const outlineColorControlId = buildCharacterControlId('dc-outline-color', k);
+    const outlineWidthControlId = buildCharacterControlId('dc-outline-width',);
+    const outlineEnabled = v.outlineEnabled === true;
+    const outlineColor = normalizeHexColor(v.outlineColor, '#000000');
+    const outlineWidth = normalizeTextOutlineWidth(v.outlineWidth, 1);
+    const outlineClass = outlineEnabled ? ' dc-text-outline' : '';
+
+const outlineStyle = outlineEnabled ? `--dc-text-outline-color:${outlineColor};--dc-text-outline-width:${outlineWidth}px;` : '';
     const safeColor = getVisualRenderState(v, { target: 'ui' }).fallbackColor;
     const pickerColor = getBaseColor(v, safeColor);
     const gradientPresentation = getGradientPresentation(v);
@@ -1826,7 +1834,17 @@ export function buildCharRowHtml(k, v) {
                     <input type="color" value="${pickerColor}" data-key="${safeKey}" class="dc-color-input" aria-label="Color for ${escapeAttr(v.name)}">
                 </span>
                 <div class="dc-char-name-wrap" title="Dialogues: ${v.dialogueCount || 0}${v.aliases?.length ? '\nAliases: ' + escapeHtml(v.aliases.join(', ')) : ''}${v.group ? '\nGroup: ' + escapeHtml(v.group) : ''}${fontName ? '\nFont: ' + escapeHtml(fontName) : ''}">
-                    <div class="dc-char-name${gradientPresentation ? ' dc-gradient-text' : ''}"${gradientPresentation ? ` ${gradientPresentation.dataAttributes}` : ''} style="${escapeAttr(buildGradientSurfaceStyle(v, { text: true }))}${fontStyle}">${escapeHtml(v.name)}</div>
+                    <div class="dc-char-name${gradientPresentation ? ' dc-gradient-text' : ''}${outlineClass}"
+                        ${gradientPresentation ? ` ${gradientPresentation.dataAttributes}` : ''}
+                        style="${escapeAttr(
+                            buildGradientSurfaceStyle(
+                                v,
+                                { text: true }
+                            )
+                        )}${fontStyle}${outlineStyle}"
+                    >
+                        ${escapeHtml(v.name)}
+                    </div>
                     <div class="dc-char-meta">
                         <span class="dc-char-count">${v.dialogueCount || 0} line${v.dialogueCount === 1 ? '' : 's'}</span>
                         ${statusBadges}
@@ -1852,6 +1870,25 @@ export function buildCharRowHtml(k, v) {
                     <button type="button" class="dc-alias menu_button" data-key="${safeKey}" data-focus-id="alias">Add Alias</button>
                     <button type="button" class="dc-group menu_button" data-key="${safeKey}" data-focus-id="group">${v.group ? 'Edit Group' : 'Set Group'}</button>
                     <button type="button" class="dc-del menu_button dc-danger-button" data-key="${safeKey}" data-focus-id="delete">Delete</button>
+                </div>
+                <div class="dc-field-row">
+                    <label class="checkbox_label">
+                        <input type="checkbox" class="dc-outline-enabled" data-key="${safeKey}" data-focus-id="outline-enabled" ${outlineEnabled ? 'checked' : ''}>
+                        <span>Text outline</span>
+                    </label>
+
+                    <label class="dc-compact-label" for="${escapeAttr(outlineColorControlId)}">
+                        Edge color
+                        <input id="${escapeAttr(outlineColorControlId)}" type="color" class="dc-outline-color" data-key="${safeKey}" data-focus-id="outline-color" value="${outlineColor}" ${outlineEnabled ? '' : 'disabled'}>
+                    </label>
+                </div>
+                <div class="dc-field-row dc-outline-width-row">
+                    <label class="dc-inline-label" for="${escapeAttr(outlineWidthControlId)}">Thickness</label>
+
+                    <input id="${escapeAttr(outlineWidthControlId)}" type="range" class="dc-outline-width" data-key="${safeKey}" data-focus-id="outline-width"
+                        min="0.25" max="3" step="0.25" value="${outlineWidth}" ${outlineEnabled ? '' : 'disabled'}>
+
+                    <span class="dc-outline-width-value">${outlineWidth}px</span>
                 </div>
                 ${buildGradientEditorHtml(k, v)}
             </div>` : ''}
@@ -2010,6 +2047,34 @@ function handleStyleSelect(styleSelect) {
     if (!characterColors[key]) return;
     characterColors[key].style = ['', 'bold', 'italic', 'bold italic'].includes(styleSelect.value) ? styleSelect.value : '';
     commit();
+    repaintDomAfterCharacterDataChange(0);
+}
+
+function handleCharacterOutlineChange(control) {
+    const key = control.dataset.key;
+    const entry = characterColors[key];
+    if (!entry) return;
+
+    if (control.classList.contains('dc-outline-enabled')){
+        entry.outlineEnabled = control.checked === true;
+
+        const row = control.closest('.dc-char');
+        const color = row?.querySelector('.dc-outline-color');
+        const width = row?.querySelector('.dc-outline-width');
+
+        if (color) color.disabled = !entry.outlineEnabled;
+        if (width) width.disabled = !entry.outlineEnabled;
+    }
+
+    if (control.classList.contains('dc-outline-color')){
+        entry.outlineColor = normalizeHexColor(control.value, '#000000');
+    }
+
+    if (control.classList.contains('dc-outline-width')){
+        entry.outlineWidth = normalizeTextOutlineWidth(control.value, 1);
+    }
+
+    commit({ inject: false });
     repaintDomAfterCharacterDataChange(0);
 }
 
@@ -3085,6 +3150,26 @@ export function installCharListDelegation(list) {
         } else if (t.classList.contains('dc-color-input')) {
             previewColorInputForElement(t);
         }
+        if (t.classList.contains('dc-outline-color')){
+            const entry = characterColors[t.dataset.key];
+            if (!entry) return;
+
+            entry.outlineColor = normalizeHexColor(t.value, '#000000');
+            repaintDomAfterCharacterDataChange(0);
+        }
+
+        if (t.classList.contains('dc-outline-width')){
+            const entry = characterColors[t.dataset.key];
+            if (!entry) return;
+
+            entry.outlineWidth = normalizeTextOutlineWidth(t.value, 1);
+
+            const row = t.closest('.dc-char');
+            const output = row?.querySelector('.dc-outline-width-value');
+            if (output) output.textContent = `${entry.outlineWidth}px`;
+
+            repaintDomAfterCharacterDataChange(0);
+        }
     });
 
     list.addEventListener('change', (e) => {
@@ -3124,6 +3209,9 @@ export function installCharListDelegation(list) {
         } else if (t.classList.contains('dc-style-select')) {
             handleStyleSelect(t);
         }
+        else if (t.classList.contains('dc-outline-enabled') || t.classList.contains('dc-outline-color') || t.classList.contains('dc-outline-width')) {
+            handleCharacterOutlineChange(t);
+        }
     });
 
     list.addEventListener('keydown', (e) => {
@@ -3140,6 +3228,13 @@ export function installCharListDelegation(list) {
         } else if (t.classList?.contains('dc-gradient-preset-rename') && e.key === 'Enter') {
             e.preventDefault();
             t.closest('.dc-gradient-editor')?.querySelector('.dc-gradient-rename-custom-preset')?.click();
+        } else if (t.classList.contains('dc-outline-width')) {
+            const row = t.closest('.dc-char');
+            const output = row?.querySelector('.dc-outline-width-value');
+            if (output) {
+                const width = normalizeTextOutlineWidth(t.value, 1);
+                output.textContent = `${width}px`;
+            }
         }
     });
 
@@ -4304,6 +4399,7 @@ export function syncUIWithSettings() {
     if ($('dc-prompt-mode')) $('dc-prompt-mode').value = settings.promptMode || 'inject';
     if ($('dc-auto-prompt-mode')) $('dc-auto-prompt-mode').checked = settings.autoPromptMode !== false;
     if ($('dc-sort')) $('dc-sort').value = settings.sortMode || 'name';
+
     syncProcessControlState();
     refreshAttributionReviewStatus();
     refreshPresetDropdown();
@@ -4565,7 +4661,7 @@ function buildSettingsPanelHtml() {
             <details class="dc-section" id="dc-page-appearance" data-dc-page="appearance" data-dc-disclosure="appearance" role="tabpanel" aria-labelledby="dc-tab-appearance" tabindex="-1">
                 <summary>Appearance</summary>
                 <div class="dc-stack">
-                    <div class="dc-field-row"><label class="dc-inline-label" for="dc-theme">Color brightness</label><select id="dc-theme" class="text_pole" data-help="Auto follows the detected chat surface. Forcing a mode sets both the color range and the readability target, ignoring what the page looks like."><option value="auto">Auto (match theme)</option><option value="dark">Bright (for dark themes)</option><option value="light">Dark (for light themes)</option></select></div>
+                    <div class="dc-field-row"><label class="dc-inline-label" for="dc-theme">Color brightness</label><select id="dc-theme" class="text_pole" data-help="Auto follows the detected chat surface. Forcing a mode sets both the color range and the readability target, ignoring what the page looks like."><option value="auto">Auto (match theme)</option><option value="dark">Bright (for dark themes)</option><option value="light">Dark (for light themes)</option><option value="raw">Unchanged</option></select></div>
                     <div class="dc-field-row"><label class="dc-inline-label" for="dc-palette">New-color palette</label><select id="dc-palette" class="text_pole"></select></div>
                     <div class="dc-field-row"><label class="dc-inline-label" for="dc-brightness">Current color brightness</label><input type="range" id="dc-brightness" min="-100" max="100" value="0"><span id="dc-bright-val" class="dc-inline-value">0</span></div>
                     <small>The value previews while dragging; colors update when released.</small>

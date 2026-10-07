@@ -13,7 +13,7 @@ import { GRADIENT_GENERATOR_ALGORITHM, advanceGradientGenerator, generateSeededG
 import { escapeHtml, generateQuietPrompt, getContext, power_user } from './st-api.js';
 import { characterColors, expandedCharacterRows, groupProfiles, setCharacterColors, setExpandedCharacterRows, setGroupProfiles, setSwapMode, settings, swapMode } from './state.js';
 import { getAutoSyncRecord, isPlainObject, persistModuleStore, saveData, saveGlobalSettingsSnapshot } from './storage.js';
-import { ASSIGNED_COLOR_MIN_DELTA_E, VALID_STYLES, colorDistance, hexToHsl, hslToHex, normalizeAliases, normalizeCharacterEntry, normalizeEntryGradientGenerator, normalizeGoogleFontName, normalizeHexColor, toast } from './utils.js';
+import { ASSIGNED_COLOR_MIN_DELTA_E, VALID_STYLES, colorDistance, hexToHsl, hslToHex, normalizeAliases, normalizeCharacterEntry, normalizeEntryGradientGenerator, normalizeGoogleFontName, normalizeHexColor, toast, normalizeTextOutlineWidth } from './utils.js';
 
 export const COLOR_THEMES = {
     pastel: [[340, 70, 75], [200, 70, 75], [120, 50, 70], [45, 80, 70], [280, 60, 75], [170, 60, 70], [20, 80, 75], [240, 60, 75]],
@@ -198,14 +198,20 @@ export function getNextColor() {
     const theme = COLOR_THEMES[settings.colorTheme] || COLOR_THEMES.pastel;
     const mode = settings.themeMode === 'auto' ? detectTheme() : settings.themeMode;
     const isDark = mode === 'dark';
+    const isRaw = mode === 'raw';
     for (const [h, s, l] of theme) {
-        const adjustedL = isDark ? Math.min(l + 15, 85) : Math.max(l - 15, 35);
+        const adjustedL = isRaw ? l : isDark ? Math.min(l + 15, 85) : Math.max(l - 15, 35);
         const color = hslToHex(h, s, adjustedL);
         if (!isPaletteSlotTaken(color, reservedColors)) return color;
     }
     const jitterThemeSlot = () => {
-        const [h, s] = theme[Math.floor(Math.random() * theme.length)];
-        return hslToHex((h + Math.random() * 60 - 30 + 360) % 360, s, isDark ? 75 : 40);
+        const [h, s, l] = theme[Math.floor(Math.random() * theme.length)];
+
+        return hslToHex(
+            (h + Math.random() * 60 - 30 + 360) % 360,
+            s,
+            isRaw ? l : (isDark ? 75 : 40)
+        );
     };
     for (let attempt = 0; attempt < PALETTE_JITTER_ATTEMPTS; attempt++) {
         const jittered = jitterThemeSlot();
@@ -1481,6 +1487,13 @@ function compensateSaturation(saturation, fromLightness, toLightness) {
 
 export function applyThemeReadabilityAndBrightness(hexColor) {
     const normalized = normalizeHexColor(hexColor);
+
+    // Exact-color mode:
+    // do not modify lightness, saturation, or contrast.
+    if (settings.themeMode === 'raw') {
+        return normalized;
+    }
+
     const [h, s, l] = hexToHsl(normalized);
     const { amount, bound, minLightness, maxLightness } = getBrightnessTravel();
     const adjustedL = Math.max(minLightness, Math.min(maxLightness, l + (amount * (bound - l))));
@@ -1490,6 +1503,17 @@ export function applyThemeReadabilityAndBrightness(hexColor) {
 
 export function resolveReadableGradient(value, primaryColor) {
     const primary = normalizeHexColor(primaryColor);
+
+    if (settings.themeMode === 'raw') {
+        return mapGradientStops(value, stop => ({
+            ...stop,
+            color: normalizeHexColor(
+                stop.baseColor || stop.color,
+                primary
+            ),
+        }));
+    }
+
     const surface = getTextContrastSurfaceColor(primary);
     const gradient = mapGradientStops(value, stop => ({
         ...stop,
@@ -1572,7 +1596,8 @@ export function setEntryFromBaseColor(entry, baseColor, options = {}) {
 
 export function setEntryFromEffectiveColor(entry, effectiveColor) {
     if (!entry) return '#888888';
-    const normalizedEffective = ensureReadableContrast(normalizeHexColor(effectiveColor, getEntryEffectiveColor(entry)));
+    const normalizedEffective = settings.themeMode === 'raw'
+            ? requested : ensureReadableContrast(normalizeHexColor(effectiveColor, getEntryEffectiveColor(entry)));
     // Store the pair syncAllEffectiveColors() would settle on rather than the requested color
     // verbatim. Every saveData() regenerates color from baseColor, and deriving a base is lossy,
     // so keeping the raw pick made the entry drift on the very next save - away from the color
@@ -2046,6 +2071,9 @@ export function buildCharacterEntry(name, options = {}) {
         keep: !!options.keep || (!bypassAutomation && shouldAutoKeepCardCharacter(trimmedName)),
         aliases: normalizeAliases(options.aliases),
         style: VALID_STYLES.has(options.style) ? options.style : '',
+        outlineEnabled: options.outlineEnabled === true,
+        outlineColor: normalizeHexColor(options.outlineColor, '#000000'),
+        outlineWidth: normalizeTextOutlineWidth(options.outlineWidth,1),
         dialogueCount: Number.isFinite(options.dialogueCount) && options.dialogueCount > 0 ? Math.floor(options.dialogueCount) : 0,
         group,
         font: normalizeGoogleFontName(options.font),

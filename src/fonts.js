@@ -6,6 +6,7 @@ import { getContext } from './st-api.js';
 import { characterColors, loadedGoogleFonts, settings } from './state.js';
 import { applyTextStyle, clearTextStyle, TEXT_STYLE_MARKER_ATTRIBUTE } from './text-style-rendering.js';
 import { getGoogleFontFamily, normalizeGoogleFontName, normalizeHexColor } from './utils.js';
+import { applyTextOutline, clearTextOutline } from './text-outline-rendering.js';
 
 export const REMOTE_FONT_REQUEST_LIMIT = 16;
 const REMOTE_FONT_LINK_SELECTOR = 'link[data-dc-google-font], link[data-dc-google-font-fallback]';
@@ -254,6 +255,7 @@ export function clearCustomFontTag(fontEl) {
     if (!fontEl) return false;
     let changed = clearGradientText(fontEl);
     if (clearTextStyle(fontEl)) changed = true;
+    if (clearTextOutline(fontEl)) changed = true;
     if (clearCustomFontOnly(fontEl)) changed = true;
     if (clearOwnedStyle(fontEl, 'color', PREVIEW_COLOR_STATE_ATTRIBUTE)) changed = true;
     if (clearOwnedAttribute(fontEl, 'aria-label', ARIA_LABEL_STATE_ATTRIBUTE)) changed = true;
@@ -263,7 +265,7 @@ export function clearCustomFontTag(fontEl) {
 
 export function clearCustomFontsFromFontTags(root = document) {
     let changed = false;
-    root?.querySelectorAll?.(`font[data-dc-font], font[data-dc-gradient], font[${TEXT_STYLE_MARKER_ATTRIBUTE}], font[data-dc-aria-label], font[data-dc-speaker-name-state], font[data-dc-preview-color]`).forEach(fontEl => {
+    root?.querySelectorAll?.(`font[data-dc-font], font[data-dc-gradient], font[${TEXT_STYLE_MARKER_ATTRIBUTE}], font[data-dc-aria-label], font[data-dc-speaker-name-state], font[data-dc-preview-color], font.dc-text-outline`).forEach(fontEl => {
         if (clearCustomFontTag(fontEl)) changed = true;
     });
     return changed;
@@ -287,6 +289,7 @@ export function applyCustomFontsToFontTags(mesText, rawText = '') {
         }
         const textStyleResult = applyTextStyle(fontEl, rendering?.entry?.style);
         if (textStyleResult.changed) changed = true;
+        if (applyTextOutline(fontEl, rendering?.entry)) changed = true;
         if (rendering?.entry) {
             const displayColor = getVisualRenderState(rendering.entry, { target: 'chat' }).fallbackColor;
             if (applyOwnedStyle(fontEl, 'color', displayColor, PREVIEW_COLOR_STATE_ATTRIBUTE)) changed = true;

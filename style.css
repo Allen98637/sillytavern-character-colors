@@ -490,7 +490,6 @@ body.dc-mark-uncertain [data-dc-colored][data-dc-confidence="low"] {
     outline: 2px solid var(--dc-accent) !important;
     outline-offset: 1px !important;
 }
-
 /* Firefox's native mark can miss 3:1 on a custom accent. Use an explicit
    contrast colour where supported; otherwise retain the native colour pair. */
 @supports (color: contrast-color(red)) and (color: rgb(from red r g b)) {
@@ -1573,6 +1572,29 @@ body.dc-mark-uncertain [data-dc-colored][data-dc-confidence="low"] {
     -webkit-text-fill-color: transparent;
     box-decoration-break: clone;
     -webkit-box-decoration-break: clone;
+}
+
+
+
+.dc-text-outline {
+    filter: var(--dc-text-outline-filter, none);
+}
+
+#dc-ext .dc-character-outline {
+    margin-top: 8px;
+}
+
+#dc-ext .dc-character-outline > .dc-field-row + .dc-field-row {
+    margin-top: 6px;
+}
+
+#dc-ext .dc-outline-width-row .dc-outline-width {
+    flex: 1 1 160px;
+}
+
+#dc-ext .dc-outline-width-value {
+    flex: 0 0 auto;
+    min-width: 42px;
 }
 
 /* A <font> tag the model left open across a blank line is split by the HTML
