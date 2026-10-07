@@ -447,7 +447,7 @@ test('a disabled extension tears down before it can resolve a storage key', () =
     assert.ok(guard > 0, 'handleChatChanged must guard on settings.enabled');
     assert.ok(charKey > guard, 'the guard must precede getCharKey()');
     assert.ok(storageKey > guard, 'the guard must precede getStorageKey()');
-    assert.match(mainSource.slice(guard, charKey), /\n {8}return;\n {4}\}/);
+    assert.match(mainSource.slice(guard, charKey), /\r?\n {8}return;\r?\n {4}\}/);
 });
 
 test('chat lifecycle captures loaded messages before scheduling decoration', () => {
